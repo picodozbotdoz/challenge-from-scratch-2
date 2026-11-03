@@ -1,1 +1,1 @@
-cat state/next-step.txt   # all milestones done; optional M8 (k6) next
+echo done   # all milestones M0-M8 complete; submission validated

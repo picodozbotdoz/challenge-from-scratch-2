@@ -43,3 +43,7 @@
 2026-11-03T13:41:13Z NOTE  M7: install.sh (build-essential + libsqlite3-dev only; NO Lean at deploy), build.sh, start.sh (foreground, env-only), README (stack, proved-vs-tested honesty line, direct mode, edge decisions), .gitignore; core dump artifact removed
 2026-11-03T13:41:13Z OK    M7: PORT=3457 bash ../repo/twelve-dollar-server-challenge/test/run.sh <abs submission dir> -> exit 0, 42/42
 2026-11-03T13:41:13Z MILE M7 done
+2026-11-03T13:50:20Z BEGIN M8: indicative k6 bench
+2026-11-03T13:50:20Z NOTE  M8: official k6 v1.1.0 installed to work/k6 (gitignored); dev box != benchmark box (4 cores vs 1 vCPU) — informational
+2026-11-03T13:50:20Z OK    M8: 100 VUs: p95=0.6ms p99=2.5ms 0% err; 1000 VUs: p95=0.58ms p99=2.2ms 0% err (8303 checks all green), server RSS 15MB
+2026-11-03T13:50:20Z MILE M8 done
