@@ -1,0 +1,10 @@
+# disposable scratch space
+work/
+# lean/lake build output
+**/.lake/
+**/build/
+# binaries
+bin/
+*.o
+# editor
+*.swp

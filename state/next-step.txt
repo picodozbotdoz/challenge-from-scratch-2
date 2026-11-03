@@ -1,0 +1,1 @@
+cd submissions/lean-asm2-picodoz/spec && ../../../tools/lean_cap.sh lake exe speccheck   # M1: real SpecCheck (start with Types/Model)
