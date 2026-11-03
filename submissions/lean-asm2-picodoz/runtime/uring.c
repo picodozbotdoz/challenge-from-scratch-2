@@ -84,11 +84,23 @@ struct io_uring_sqe *uring_next_sqe(uring_t *u) {
   return sqe;
 }
 
+/* resync sq_pending from the shared ring after an enter: the kernel advances
+ * sq_head as it consumes SQEs, so tail-head is the truth. Without this, a
+ * retry after EINTR would re-submit already-consumed SQEs. */
+static void sync_pending(uring_t *u) {
+  uint32_t tail = __atomic_load_n(u->sq_tail, __ATOMIC_ACQUIRE);
+  uint32_t head = __atomic_load_n(u->sq_head, __ATOMIC_ACQUIRE);
+  u->sq_pending = tail - head;
+}
+
 int uring_submit(uring_t *u) {
   if (u->sq_pending == 0) return 0;
   int n = sys_io_uring_enter(u->fd, u->sq_pending, 0, 0);
-  if (n < 0) return -1;
-  u->sq_pending = 0;
+  if (n < 0) {
+    if (errno == EINTR) sync_pending(u);   /* some SQEs may already be consumed */
+    return -1;
+  }
+  sync_pending(u);
   return n;
 }
 
@@ -103,12 +115,15 @@ int uring_get_cqe(uring_t *u, struct io_uring_cqe *out) {
 }
 
 /* blocking wait for one completion; returns 0 = cqe ready, 1 = interrupted by
- * a signal (caller may retry — its handlers have usually run), -1 = error */
+ * a signal (caller may retry — its handlers have usually run), -1 = error.
+ * M13: pending SQEs ride the same enter (submit+wait merge — one syscall per
+ * batch instead of two). */
 int uring_wait(uring_t *u, struct io_uring_cqe *out) {
   if (uring_get_cqe(u, out) == 0) return 0;
-  int n = sys_io_uring_enter(u->fd, 0, 1, IORING_ENTER_GETEVENTS);
-  if (n < 0 && errno == EINTR) return 1;
+  int n = sys_io_uring_enter(u->fd, u->sq_pending, 1, IORING_ENTER_GETEVENTS);
+  if (n < 0 && errno == EINTR) { sync_pending(u); return 1; }
   if (n < 0 && errno != EAGAIN) return -1;
+  if (n >= 0) sync_pending(u);           /* submit part succeeded (or was empty) */
   if (uring_get_cqe(u, out) == 0) return 0;
   return -EAGAIN;                        /* spurious wakeup: caller retries */
 }

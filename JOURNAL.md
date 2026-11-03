@@ -55,3 +55,5 @@
 2026-11-03T18:05:57Z OK    M11: 42/42; 4000VU p95=0.61ms p99=6.0ms max=59ms; no-drop/no-exit arm path, submit-before-wait invariant
 2026-11-03T18:13:27Z BEGIN M12: fix#3 out-buffer overhaul — escape fast path, manual itoa, scratch buf reuse (abi.c/main.c)
 2026-11-03T18:13:27Z OK    M12: 42/42; saturated 14705 -> 16048 req/s (+9.1%); tail unchanged
+2026-11-03T18:20:26Z BEGIN M13: fix#4 SQLITE_OPEN_NOMUTEX + submit/wait enter merge + EINTR sync_pending fix (db.c/uring.c)
+2026-11-03T18:20:26Z OK    M13: 42/42; saturated 16048 -> 16365 req/s; tail clean; latent double-submit-after-EINTR bug fixed

@@ -37,7 +37,8 @@ static void *ckpt_main(void *arg) {
 
 static int ckpt_start(const char *path) {
   char *err = NULL;
-  if (sqlite3_open_v2(path, &g_ckpt_db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK)
+  if (sqlite3_open_v2(path, &g_ckpt_db, SQLITE_OPEN_READWRITE |
+                                SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK)
     goto fail;
   (void)sqlite3_exec(g_ckpt_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &err);
   if (err) { sqlite3_free(err); err = NULL; }
@@ -74,7 +75,10 @@ static sqlite3_stmt *stmt_lookup(const char *sql, int64_t len) {
 }
 
 int db_open(const char *path) {
-  if (sqlite3_open_v2(path, &g_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL) != SQLITE_OK)
+  /* NOMUTEX: each connection is used by exactly one thread (event loop /
+   * checkpoint worker) — skip per-connection mutexes (1.5% of hot CPU) */
+  if (sqlite3_open_v2(path, &g_db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                                SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK)
     return -1;
   sqlite3_busy_timeout(g_db, 2000);
   /* rules: WAL + synchronous=NORMAL or stronger; no caching of data across

@@ -1,0 +1,33 @@
+# opt-doc-5 — Fix #4: SQLITE_OPEN_NOMUTEX + submit/wait enter merge (+ EINTR fix)
+
+Date: 2026-11-04 · Branch: `dev/optimize2` · Parent: opt-doc-4
+
+## Changes (`runtime/db.c`, `runtime/uring.c`)
+
+1. **`SQLITE_OPEN_NOMUTEX`** on both connections (writer + checkpoint worker).
+   Each connection is used by exactly one thread, so the per-connection
+   mutexes sqlite takes on every API call are pure overhead — perf showed
+   `pthread_mutex_lock` at 1.56% of hot CPU. Library stays threadsafe
+   (`sqlite3_threadsafe()>0` gate for the worker is unchanged).
+
+2. **Submit/wait merge** (`uring_wait`): pending SQEs now ride the same
+   `io_uring_enter(to_submit=sq_pending, min_complete=1, GETEVENTS)` that
+   waits for a completion — one syscall per batch instead of two. When
+   nothing is pending, behavior is unchanged (`to_submit=0`).
+
+3. **EINTR correctness fix (latent bug)**: on a signal-interrupted enter, the
+   kernel may have consumed some SQEs; the old code kept `sq_pending`
+   unchanged, so the next submit would **re-submit consumed SQEs** (duplicate
+   accepts/reads — chaos on a 10 s cadence tick over a long soak). New
+   `sync_pending()` recomputes `tail - head` from the shared ring after every
+   enter (success and EINTR), in both `uring_submit` and `uring_wait`.
+
+## Verification
+
+- `tools/test_local.sh`: **42/42**.
+- Saturation A/B (hot.js 300 VUs): **16,048 → 16,365 req/s (+2.0%)** —
+  smaller than fix #3 as expected (mutex + syscall overhead were ~2-3% total).
+- 4000-VU tail (official shape): p95=0.56ms, p99=20.1ms, max=65.2ms — within
+  the post-fix band (p99 6-20ms across runs; run-to-run variance from k6/GC
+  on a shared box).
+- Sequential-curl spot check: merged enter live, no deadlock; 2 threads.
