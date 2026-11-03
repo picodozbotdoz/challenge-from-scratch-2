@@ -1,1 +1,1 @@
-echo done   # all milestones M0-M8 complete; submission validated
+git push -u origin master

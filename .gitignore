@@ -6,5 +6,8 @@ work/
 # binaries
 bin/
 *.o
+# core dumps (process memory can capture env secrets — never commit)
+core
+core.*
 # editor
 *.swp

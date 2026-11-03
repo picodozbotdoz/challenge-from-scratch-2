@@ -47,3 +47,4 @@
 2026-11-03T13:50:20Z NOTE  M8: official k6 v1.1.0 installed to work/k6 (gitignored); dev box != benchmark box (4 cores vs 1 vCPU) — informational
 2026-11-03T13:50:20Z OK    M8: 100 VUs: p95=0.6ms p99=2.5ms 0% err; 1000 VUs: p95=0.58ms p99=2.2ms 0% err (8303 checks all green), server RSS 15MB
 2026-11-03T13:50:20Z MILE M8 done
+2026-11-03T14:10:29Z NOTE  push blocked by GitHub secret scanning: core.575023 (1.8MB core dump committed in M4, present through M6) captured process env incl. real AZURE_DEVOPS_EXT_PAT + TOKEN. History scrubbed via filter-branch index-filter (only that path removed; M0-M3 hashes unchanged), refs/original+reflog+gc purged (blob 5ac86ce verified absent). .gitignore now covers core/core.*. Secret never left the box (push was blocked); rotate the Azure PAT if in doubt.
