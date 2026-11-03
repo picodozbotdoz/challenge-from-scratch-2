@@ -1,0 +1,61 @@
+# opt-doc-2 — Fix #1: checkpoint worker — fdatasync off the event loop
+
+Date: 2026-11-04 · Branch: `dev/optimize2` · Parent: opt-doc-1
+
+## Change
+
+`runtime/db.c` + `build.sh` (-lpthread). No ABI change, no emitted-code change
+(gen/app_gen.s untouched — no re-derive/promotion needed).
+
+- Event-loop connection now runs `PRAGMA wal_autocheckpoint=0`.
+  With `synchronous=NORMAL` in WAL mode, the writer path never fdatasyncs on
+  commit, so with autocheckpoint off the event loop performs **zero** fdatasyncs.
+- New worker thread (started in `db_open`, joined in `db_close`) opens its own
+  connection and runs `sqlite3_wal_checkpoint_v2(PASSIVE)` every 200 ms
+  (busy_timeout 100 ms so a contended checkpoint gives up and retries).
+  PASSIVE never blocks readers/writers; all main-db fdatasyncs — including
+  jbd2 journal-commit stalls — now land in the worker.
+- Defensive fallback: if `sqlite3_threadsafe()==0` or the worker can't start,
+  the old inline `wal_autocheckpoint=1000` behavior is restored. Kill-switch
+  semantics preserved: worst case equals the previous build.
+- Durability unchanged: journal_mode=WAL + synchronous=NORMAL kept; PASSIVE
+  checkpoints are what autocheckpoint already did, moved off-thread.
+
+## Why (evidence from opt-doc-1)
+
+Inline `wal_autocheckpoint` fdatasyncs the main db inside `sqlite3_step` on
+the event loop: strace showed 62 syncs/run, median 7.45 ms, max 106 ms, and
+the 5 Hz wchan probe caught `jbd2_log_wait_commit`. A rare jbd2 stall under
+disk contention froze the whole server 4.4–7.5 s (all 4000 connections), the
+direct cause of the failing p99=5.93 s tail run.
+
+## Verification
+
+- `tools/test_local.sh`: **42/42**.
+- Worker sanity: 2 threads; main in `io_cqring_wait`, worker in
+  `hrtimer_nanosleep`.
+- Tail runs, official shape (60 s ramp + 120 s hold), fresh seed DB each run:
+
+| VUs | p95 | p99 | max | vs pre-fix (4 runs) |
+|---|---|---|---|---|
+| 4000 | 0.61 ms | 13.68 ms | **61.8 ms** | pre-fix max: 455 ms / 7.52 s / 210 ms / 89 ms |
+| 4000 | 0.61 ms | 9.85 ms | **57.7 ms** | freeze mode eliminated in 2/2 runs |
+| 8000 | 0.54 ms | 1.23 ms | 69.4 ms | passes with 800× headroom on p99 |
+
+- WAL stays bounded (peak 4.18 MB, wraps after each full checkpoint) — the
+  worker keeps up under 15% write mix.
+- Server CPU over a 221 s run: 11.4 s (~5% of one core at 4000 VUs) — the
+  worker adds no meaningful CPU.
+
+## Residual tail (~50–70 ms max)
+
+Remaining worst-case is now bounded by checkpoint WRITER-lock hold time during
+page copy (few ms typical; can stretch if the disk is slow) plus scheduler
+noise from 4000–8000 k6 VUs. Two orders of magnitude below the 1000 ms
+threshold — acceptable for now; revisit only if the judge box shows otherwise.
+
+## Harness fix needed
+
+`run_tail.sh` appends telemetry to the same CSV across runs (k6 output is
+overwritten per run, so summary numbers are trustworthy; telemetry needs
+per-run dirs). Fix before the next doc's measurements.

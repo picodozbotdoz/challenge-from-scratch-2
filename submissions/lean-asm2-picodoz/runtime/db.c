@@ -3,13 +3,57 @@
 #include "abi.h"
 
 #include <sqlite3.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 sqlite3 *g_db = NULL;
 int64_t g_start_sec = 0;
+
+/* ---- checkpoint worker (M10) ----------------------------------------------
+ * Inline wal_autocheckpoint fdatasyncs the main db ON THE EVENT LOOP inside
+ * sqlite3_step (measured: median 7.45ms, max 106ms per sync, every ~2.4s under
+ * load — and rare jbd2 stalls froze all connections for 4-8s). Fix: the writer
+ * runs with wal_autocheckpoint=0 (synchronous=NORMAL => WAL commits never
+ * sync), and this worker's own connection runs periodic PASSIVE checkpoints,
+ * absorbing every main-db fdatasync. PASSIVE never blocks readers/writers. */
+static pthread_t g_ckpt_thread;
+static volatile int g_ckpt_run = 0;
+static sqlite3 *g_ckpt_db = NULL;
+
+static void *ckpt_main(void *arg) {
+  (void)arg;
+  while (g_ckpt_run) {
+    struct timespec ts = { 0, 200 * 1000 * 1000 };   /* 200 ms */
+    nanosleep(&ts, NULL);
+    if (g_ckpt_db)
+      (void)sqlite3_wal_checkpoint_v2(g_ckpt_db, NULL, SQLITE_CHECKPOINT_PASSIVE, NULL, NULL);
+  }
+  return NULL;
+}
+
+static int ckpt_start(const char *path) {
+  char *err = NULL;
+  if (sqlite3_open_v2(path, &g_ckpt_db, SQLITE_OPEN_READWRITE, NULL) != SQLITE_OK)
+    goto fail;
+  (void)sqlite3_exec(g_ckpt_db, "PRAGMA journal_mode=WAL;", NULL, NULL, &err);
+  if (err) { sqlite3_free(err); err = NULL; }
+  sqlite3_busy_timeout(g_ckpt_db, 100);            /* give up fast, retry next tick */
+  (void)sqlite3_exec(g_ckpt_db, "PRAGMA cache_size=-2000;", NULL, NULL, &err);
+  if (err) { sqlite3_free(err); err = NULL; }
+  g_ckpt_run = 1;
+  if (pthread_create(&g_ckpt_thread, NULL, ckpt_main, NULL) != 0) {
+    g_ckpt_run = 0;
+    goto fail;
+  }
+  return 0;
+fail:
+  if (g_ckpt_db) { sqlite3_close(g_ckpt_db); g_ckpt_db = NULL; }
+  return -1;
+}
 
 /* prepared-statement cache: keyed by SQL text (prepared-statement reuse is
  * explicitly allowed by the rules — they cache the plan, not the data) */
@@ -43,11 +87,28 @@ int db_open(const char *path) {
   (void)sqlite3_exec(g_db, "PRAGMA cache_size=-16384;", NULL, NULL, &err);  /* 16 MiB */
   (void)sqlite3_exec(g_db, "PRAGMA mmap_size=268435456;", NULL, NULL, &err); /* 256 MiB */
   if (err) sqlite3_free(err);
+
+  /* M10: move checkpoint fdatasyncs off the event loop. If the worker cannot
+   * start (or sqlite is not threadsafe), fall back to inline autocheckpoint. */
+  if (sqlite3_threadsafe() > 0 && ckpt_start(path) == 0) {
+    err = NULL;
+    (void)sqlite3_exec(g_db, "PRAGMA wal_autocheckpoint=0;", NULL, NULL, &err);
+    if (err) sqlite3_free(err);
+  } else {
+    err = NULL;
+    (void)sqlite3_exec(g_db, "PRAGMA wal_autocheckpoint=1000;", NULL, NULL, &err);
+    if (err) sqlite3_free(err);
+  }
   g_start_sec = (int64_t)time(NULL);
   return 0;
 }
 
 void db_close(void) {
+  if (g_ckpt_run) {
+    g_ckpt_run = 0;
+    pthread_join(g_ckpt_thread, NULL);
+  }
+  if (g_ckpt_db) { sqlite3_close(g_ckpt_db); g_ckpt_db = NULL; }
   for (int i = 0; i < g_stmt_count; i++) {
     sqlite3_finalize(g_stmts[i].stmt);
     free(g_stmts[i].sql);
