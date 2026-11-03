@@ -19,7 +19,7 @@ if [ -f /usr/include/sqlite3.h ]; then SQLINC=""; SQLLIB=""; fi
 cc -O2 -Wall $SQLINC -c -o bin/app_gen.o "$ASM"
 for f in runtime/main.c runtime/http.c runtime/db.c runtime/abi.c runtime/uring.c; do
   o="bin/$(basename "${f%.c}").o"
-  cc -O2 -Wall $SQLINC -c -o "$o" "$f"
+  cc -g -O2 -Wall $SQLINC -c -o "$o" "$f"
 done
-cc -no-pie -o bin/server bin/app_gen.o bin/main.o bin/http.o bin/db.o bin/abi.o bin/uring.o $SQLLIB -lsqlite3
+cc -g -no-pie -o bin/server bin/app_gen.o bin/main.o bin/http.o bin/db.o bin/abi.o bin/uring.o $SQLLIB -lsqlite3
 echo "built bin/server ($(stat -c%s bin/server) bytes)"

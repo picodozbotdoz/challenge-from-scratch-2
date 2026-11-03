@@ -21,3 +21,9 @@
 2026-11-03T12:06:20Z NOTE  M3: bug fixed — .Lemit_post called C with misaligned stack (entered via call => rsp%16==8); added sub/add 8 frame
 2026-11-03T12:06:20Z OK    M3: suite passed=15 (goldens 1-6, health, 404s, id classification, post-not-found, feed length); gen/app_gen.s promoted
 2026-11-03T12:06:20Z MILE M3 done
+2026-11-03T12:42:03Z BEGIN M4: auth in asm
+2026-11-03T12:42:03Z NOTE  M4: emitted SHA-256/HMAC-SHA256/base64url codec/strict-UTF8/JSON-field-scan/JWT pipeline (bearer parse, split, alg=HS256, signature, exp>now, sub digits>=1, username string) + POST routing (auth BEFORE id)
+2026-11-03T12:42:03Z NOTE  M4: crypto helpers exported global (sha256_asm etc + _c wrappers) -> tests/asm_selftest.c validates against published vectors (RFC 4231 incl long-key); all green
+2026-11-03T12:42:03Z NOTE  M4: bugs fixed en route: sigma0/1 shift-of-rotated (need 3rd copy), b64enc tail shifts, p64 pointer vs index, auth_len sign-extension (movsx), payload [rsp+0x200] mov->lea, .Lac_err3 fallthrough, ah-register encoding
+2026-11-03T12:42:03Z OK    M4: suite passed=25 (checks 14-22 auth all green); asm selftest PASS; promoted
+2026-11-03T12:42:03Z MILE M4 done

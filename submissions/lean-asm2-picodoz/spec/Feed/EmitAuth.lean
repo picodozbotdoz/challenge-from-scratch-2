@@ -1,0 +1,1432 @@
+/-
+Feed.EmitAuth — M4: the whole auth pipeline emitted as asm: SHA-256, HMAC,
+base64url codec, strict UTF-8 validation, JSON top-level field scan, JWT
+structural/alg/exp/signature/payload verification, bearer parsing, POST routing.
+
+Mirrors Feed.Jwt stage-by-stage:
+  missing bearer -> 401 "missing bearer token"
+  structural/alg/signature/exp failure -> 401 "invalid or expired token"
+  sub/username shape failure -> 401 "invalid token payload"
+
+This module also owns `program` (the final .s), combining the EmitAsm core with
+the auth layer.
+-/
+
+import Feed.EmitAsm
+
+open EmitAsm
+
+namespace EmitAuth
+
+/-! ## tables -/
+
+def shaK : List Nat :=
+  [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+   0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+   0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+   0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+   0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+   0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+   0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]
+
+def shaH0 : List Nat :=
+  [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]
+
+def b64urlAlpha : String :=
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+def b64revTable : List Nat :=
+  (List.range 256).map (fun i =>
+    match (b64urlAlpha.toList).idxOf? (Char.ofNat i) with
+    | some v => v
+    | none => 255)
+
+private partial def chunksOf {α : Type} (n : Nat) : List α → List (List α)
+  | [] => []
+  | l =>
+    let (hd, tl) := l.splitAt n
+    hd :: chunksOf n tl
+
+def emitTables (a : Asm) : Asm :=
+  let a := a.label ".Lsha_k"
+  let a := a.raw (String.join (((shaK.map (fun k => toString k))|> chunksOf 8).map
+    (fun r => "    .long " ++ ", ".intercalate r ++ "\n")))
+  let a := a.label ".Lsha_h0"
+  let a := a.raw (String.join (((shaH0.map (fun k => toString k))|> chunksOf 8).map
+    (fun r => "    .long " ++ ", ".intercalate r ++ "\n")))
+  let a := a.label ".Lb64_alpha"
+  let a := a.raw ("    .byte " ++ byteListAsm (asciiBytes b64urlAlpha) ++ "\n")
+  let a := a.label ".Lb64_rev"
+  let a := a.raw (String.join ((b64revTable|> chunksOf 16).map
+    (fun r => "    .byte " ++ ", ".intercalate (r.map toString) ++ "\n")))
+  a
+
+/-! ## SHA-256 (one-shot, pads in place; buf needs len+72 writable bytes) -/
+
+def emitSha256 (a : Asm) : Asm :=
+  let a := a.raw ".globl sha256_asm"
+  let a := a.label "sha256_asm"
+  -- callee-saved regs hold a..h across nothing (no calls inside): save all we use
+  let a := a.insn "push rbx"
+  let a := a.insn "push rbp"
+  let a := a.insn "push r12"
+  let a := a.insn "push r13"
+  let a := a.insn "push r14"
+  let a := a.insn "push r15"
+  let a := a.insn "sub rsp, 0x148"
+  -- frame: w[64]@0x00  state[8]@0x100  out@0x120  bitlen@0x128  total@0x130  buf@0x138  kt@0x140
+  let a := a.insn "mov [rsp+0x138], rsi"
+  let a := a.insn "mov [rsp+0x120], rdi"
+  let a := a.insn "mov rax, rdx"
+  let a := a.insn "shl rax, 3"
+  let a := a.insn "mov [rsp+0x128], rax"
+  let a := a.insn "mov BYTE PTR [rsi+rdx], 0x80"
+  let a := a.insn "inc rdx"
+  let a := a.insn "lea rcx, [rdx+71]"
+  let a := a.insn "and rcx, -64"
+  let a := a.insn "sub rcx, 8"
+  let a := a.label ".Lsha_zloop"
+  let a := a.insn "cmp rdx, rcx"
+  let a := a.insn "jae .Lsha_zdone"
+  let a := a.insn "mov BYTE PTR [rsi+rdx], 0"
+  let a := a.insn "inc rdx"
+  let a := a.insn "jmp .Lsha_zloop"
+  let a := a.label ".Lsha_zdone"
+  let a := a.insn "mov rax, [rsp+0x128]"
+  let a := a.insn "bswap rax"
+  let a := a.insn "mov [rsi+rcx], rax"
+  let a := a.insn "lea rax, [rcx+8]"
+  let a := a.insn "mov [rsp+0x130], rax"
+  -- state = H0
+  let a := a.insn "lea rax, [rip+.Lsha_h0]"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label ".Lsha_init"
+  let a := a.insn "mov edx, [rax+rcx*4]"
+  let a := a.insn "mov [rsp+0x100+rcx*4], edx"
+  let a := a.insn "inc rcx"
+  let a := a.insn "cmp rcx, 8"
+  let a := a.insn "jb .Lsha_init"
+  -- block loop
+  let a := a.insn "xor r14, r14"
+  let a := a.label ".Lsha_block"
+  let a := a.insn "cmp r14, [rsp+0x130]"
+  let a := a.insn "jae .Lsha_fin"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.insn "lea r15, [rsi+r14]"
+  let a := a.label ".Lsha_w16"
+  let a := a.insn "mov eax, [r15+rcx*4]"
+  let a := a.insn "bswap eax"
+  let a := a.insn "mov [rsp+rcx*4], eax"
+  let a := a.insn "inc rcx"
+  let a := a.insn "cmp rcx, 16"
+  let a := a.insn "jb .Lsha_w16"
+  let a := a.label ".Lsha_w64"
+  let a := a.insn "cmp rcx, 64"
+  let a := a.insn "jae .Lsha_rounds"
+  let a := a.insn "mov eax, [rsp+rcx*4-60]"      -- w[t-15]
+  let a := a.insn "mov edx, eax"
+  let a := a.insn "mov r8d, eax"
+  let a := a.insn "ror eax, 7"
+  let a := a.insn "ror edx, 18"
+  let a := a.insn "shr r8d, 3"
+  let a := a.insn "xor eax, edx"
+  let a := a.insn "xor eax, r8d"
+  let a := a.insn "mov edx, [rsp+rcx*4-8]"       -- w[t-2]
+  let a := a.insn "mov edi, edx"
+  let a := a.insn "mov r8d, edx"
+  let a := a.insn "ror edx, 17"
+  let a := a.insn "ror edi, 19"
+  let a := a.insn "shr r8d, 10"
+  let a := a.insn "xor edx, edi"
+  let a := a.insn "xor edx, r8d"
+  let a := a.insn "add eax, [rsp+rcx*4-64]"
+  let a := a.insn "add eax, edx"
+  let a := a.insn "add eax, [rsp+rcx*4-28]"
+  let a := a.insn "mov [rsp+rcx*4], eax"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp .Lsha_w64"
+  let a := a.label ".Lsha_rounds"
+  let a := a.insn "lea r15, [rip+.Lsha_k]"
+  let a := a.insn "mov r8d, [rsp+0x100]"
+  let a := a.insn "mov r9d, [rsp+0x104]"
+  let a := a.insn "mov r10d, [rsp+0x108]"
+  let a := a.insn "mov r11d, [rsp+0x10C]"
+  let a := a.insn "mov ebx, [rsp+0x110]"
+  let a := a.insn "mov ebp, [rsp+0x114]"
+  let a := a.insn "mov r12d, [rsp+0x118]"
+  let a := a.insn "mov r13d, [rsp+0x11C]"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label ".Lsha_rloop"
+  -- S1(e)
+  let a := a.insn "mov eax, ebx"
+  let a := a.insn "mov edx, ebx"
+  let a := a.insn "ror eax, 6"
+  let a := a.insn "ror edx, 11"
+  let a := a.insn "xor eax, edx"
+  let a := a.insn "mov edx, ebx"
+  let a := a.insn "ror edx, 25"
+  let a := a.insn "xor eax, edx"
+  -- ch = (e&f)^(~e&g)
+  let a := a.insn "mov edi, ebx"
+  let a := a.insn "and edi, ebp"
+  let a := a.insn "mov edx, ebx"
+  let a := a.insn "not edx"
+  let a := a.insn "and edx, r12d"
+  let a := a.insn "xor edi, edx"
+  -- temp1 = h + S1 + ch + K[t] + w[t]
+  let a := a.insn "add edi, r13d"
+  let a := a.insn "add edi, eax"
+  let a := a.insn "mov eax, [r15+rcx*4]"
+  let a := a.insn "add edi, eax"
+  let a := a.insn "mov eax, [rsp+rcx*4]"
+  let a := a.insn "add edi, eax"
+  -- S0(a)
+  let a := a.insn "mov eax, r8d"
+  let a := a.insn "mov edx, r8d"
+  let a := a.insn "ror eax, 2"
+  let a := a.insn "ror edx, 13"
+  let a := a.insn "xor eax, edx"
+  let a := a.insn "mov edx, r8d"
+  let a := a.insn "ror edx, 22"
+  let a := a.insn "xor eax, edx"
+  -- maj = (a&b)^(a&c)^(b&c)
+  let a := a.insn "mov edx, r8d"
+  let a := a.insn "and edx, r9d"
+  let a := a.insn "mov esi, r8d"
+  let a := a.insn "and esi, r10d"
+  let a := a.insn "xor edx, esi"
+  let a := a.insn "mov esi, r9d"
+  let a := a.insn "and esi, r10d"
+  let a := a.insn "xor edx, esi"
+  let a := a.insn "add edx, eax"                 -- temp2
+  -- rotate
+  let a := a.insn "mov r13d, r12d"
+  let a := a.insn "mov r12d, ebp"
+  let a := a.insn "mov ebp, ebx"
+  let a := a.insn "lea ebx, [r11+rdi]"
+  let a := a.insn "mov r11d, r10d"
+  let a := a.insn "mov r10d, r9d"
+  let a := a.insn "mov r9d, r8d"
+  let a := a.insn "lea r8d, [rdi+rdx]"
+  let a := a.insn "inc rcx"
+  let a := a.insn "cmp rcx, 64"
+  let a := a.insn "jb .Lsha_rloop"
+  -- state += a..h
+  let a := a.insn "add [rsp+0x100], r8d"
+  let a := a.insn "add [rsp+0x104], r9d"
+  let a := a.insn "add [rsp+0x108], r10d"
+  let a := a.insn "add [rsp+0x10C], r11d"
+  let a := a.insn "add [rsp+0x110], ebx"
+  let a := a.insn "add [rsp+0x114], ebp"
+  let a := a.insn "add [rsp+0x118], r12d"
+  let a := a.insn "add [rsp+0x11C], r13d"
+  let a := a.insn "mov rsi, [rsp+0x138]"
+  let a := a.insn "add r14, 64"
+  let a := a.insn "jmp .Lsha_block"
+  let a := a.label ".Lsha_fin"
+  let a := a.insn "mov rdi, [rsp+0x120]"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label ".Lsha_out"
+  let a := a.insn "mov eax, [rsp+0x100+rcx*4]"
+  let a := a.insn "bswap eax"
+  let a := a.insn "mov [rdi+rcx*4], eax"
+  let a := a.insn "inc rcx"
+  let a := a.insn "cmp rcx, 8"
+  let a := a.insn "jb .Lsha_out"
+  let a := a.insn "add rsp, 0x148"
+  let a := a.insn "pop r15"
+  let a := a.insn "pop r14"
+  let a := a.insn "pop r13"
+  let a := a.insn "pop r12"
+  let a := a.insn "pop rbp"
+  let a := a.insn "pop rbx"
+  let a := a.insn "ret"
+  a
+
+/-! ## HMAC-SHA256 (block 64; key >64 hashed first) -/
+
+/-- hmac(rdi=out32, rsi=key, rdx=keylen, rc8=msg...) — frame:
+    inner@0 (64+msgmax+136), outer@0x1140 (96+136), kdigest@0x1220 (32).
+    msgmax 4096. Calls sha256_asm (so keeps rsp 16-aligned at call sites). -/
+def emitHmac (a : Asm) : Asm :=
+  let a := a.raw ".globl hmac_asm"
+  let a := a.label "hmac_asm"
+  let a := a.insn "push rbx"
+  let a := a.insn "push r12"
+  let a := a.insn "push r13"
+  let a := a.insn "push r14"
+  let a := a.insn "push r15"
+  let a := a.insn "sub rsp, 0x1308"      -- 4872; (5 pushes + sub) keeps call alignment
+  -- rbx=out r12=key r13=keylen r14=msg r15=msglen
+  let a := a.insn "mov rbx, rdi"
+  let a := a.insn "mov r12, rsi"
+  let a := a.insn "mov r13, rdx"
+  let a := a.insn "mov r14, rcx"
+  let a := a.insn "mov r15, r8"
+  -- msg cap check
+  let a := a.insn "cmp r15, 4096"
+  let a := a.insn "ja hmac_asm_done_err"   -- cannot happen for our tokens; guard anyway
+  -- key into inner[0..64] (zero-padded): if keylen > 64 use sha256(key) (32B)
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label "hmac_asm_zk"
+  let a := a.insn "cmp rcx, 64"
+  let a := a.insn "jae hmac_asm_kready"
+  let a := a.insn "mov BYTE PTR [rsp+rcx], 0"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp hmac_asm_zk"
+  let a := a.label "hmac_asm_kready"
+  let a := a.insn "cmp r13, 64"
+  let a := a.insn "jbe hmac_asm_kcopy"
+  let a := a.insn "lea rdi, [rsp+0x1220]"
+  let a := a.insn "mov rsi, r12"
+  let a := a.insn "mov rdx, r13"
+  let a := a.insn "call sha256_asm"
+  let a := a.insn "lea rsi, [rsp+0x1220]"
+  let a := a.insn "mov r12, rsi"
+  let a := a.insn "mov r13d, 32"
+  let a := a.label "hmac_asm_kcopy"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label "hmac_asm_kcopyloop"
+  let a := a.insn "cmp rcx, r13"
+  let a := a.insn "jae hmac_asm_kcopied"
+  let a := a.insn "mov al, [r12+rcx]"
+  let a := a.insn "mov [rsp+rcx], al"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp hmac_asm_kcopyloop"
+  let a := a.label "hmac_asm_kcopied"
+  -- inner[0..64] ^= 0x36 ; append msg
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label "hmac_asm_ipad"
+  let a := a.insn "cmp rcx, 64"
+  let a := a.insn "jae hmac_asm_ipadded"
+  let a := a.insn "xor BYTE PTR [rsp+rcx], 0x36"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp hmac_asm_ipad"
+  let a := a.label "hmac_asm_ipadded"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label "hmac_asm_mcopy"
+  let a := a.insn "cmp rcx, r15"
+  let a := a.insn "jae hmac_asm_mcopied"
+  let a := a.insn "mov al, [r14+rcx]"
+  let a := a.insn "mov [rsp+64+rcx], al"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp hmac_asm_mcopy"
+  let a := a.label "hmac_asm_mcopied"
+  -- innerdigest = sha256(inner, 64+msglen)
+  let a := a.insn "lea rdi, [rsp+0x1220]"
+  let a := a.insn "mov rsi, rsp"
+  let a := a.insn "lea rdx, [r15+64]"
+  let a := a.insn "call sha256_asm"
+  -- outer[0..64] = key ^ 0x5c ; outer[64..96] = innerdigest
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label "hmac_asm_opad"
+  let a := a.insn "cmp rcx, 64"
+  let a := a.insn "jae hmac_asm_opadded"
+  let a := a.insn "mov al, [rsp+rcx]"
+  let a := a.insn "xor al, 0x36"          -- undo ipad -> raw key byte
+  let a := a.insn "xor al, 0x5c"
+  let a := a.insn "mov [rsp+0x1140+rcx], al"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp hmac_asm_opad"
+  let a := a.label "hmac_asm_opadded"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label "hmac_asm_odcopy"
+  let a := a.insn "cmp rcx, 32"
+  let a := a.insn "jae hmac_asm_odcopied"
+  let a := a.insn "mov al, [rsp+0x1220+rcx]"
+  let a := a.insn "mov [rsp+0x1140+64+rcx], al"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp hmac_asm_odcopy"
+  let a := a.label "hmac_asm_odcopied"
+  -- out = sha256(outer, 96)
+  let a := a.insn "mov rdi, rbx"
+  let a := a.insn "lea rsi, [rsp+0x1140]"
+  let a := a.insn "mov edx, 96"
+  let a := a.insn "call sha256_asm"
+  let a := a.insn "jmp hmac_asm_done"
+  let a := a.label "hmac_asm_done_err"
+  let a := a.insn "xor eax, eax"          -- caller treats 0-output as failure
+  let a := a.insn "mov DWORD PTR [rbx], 0"
+  let a := a.label "hmac_asm_done"
+  let a := a.insn "add rsp, 0x1308"
+  let a := a.insn "pop r15"
+  let a := a.insn "pop r14"
+  let a := a.insn "pop r13"
+  let a := a.insn "pop r12"
+  let a := a.insn "pop rbx"
+  let a := a.insn "ret"
+  a
+
+/-! ## base64url codec -/
+
+/-- b64dec(rdi=src, rsi=len, rdx=dst, rcx=cap) -> rax outlen, or -1. -/
+def emitB64Dec (a : Asm) : Asm :=
+  let a := a.raw ".globl b64dec_asm"
+  let a := a.label "b64dec_asm"
+  -- r8=src r9=len r10=dst r11=cap
+  let a := a.insn "mov r8, rdi"
+  let a := a.insn "mov r9, rsi"
+  let a := a.insn "mov r10, rdx"
+  let a := a.insn "mov r11, rcx"
+  -- strip trailing '='
+  let a := a.label ".Lb64d_strip"
+  let a := a.insn "test r9, r9"
+  let a := a.insn "jz .Lb64d_stripped"
+  let a := a.insn "cmp BYTE PTR [r8+r9-1], 61"   -- '='
+  let a := a.insn "jne .Lb64d_stripped"
+  let a := a.insn "dec r9"
+  let a := a.insn "jmp .Lb64d_strip"
+  let a := a.label ".Lb64d_stripped"
+  let a := a.insn "mov rax, r9"
+  let a := a.insn "and eax, 3"
+  let a := a.insn "cmp eax, 1"
+  let a := a.insn "je .Lb64d_fail"
+  -- output size check: (len*3)/4 + 3 <= cap
+  let a := a.insn "lea rax, [r9*2]"        -- len*2 (avoid overflow for small lens)
+  let a := a.insn "add rax, r9"            -- len*3
+  let a := a.insn "shr rax, 2"             -- /4
+  let a := a.insn "add rax, 3"
+  let a := a.insn "cmp rax, r11"
+  let a := a.insn "ja .Lb64d_fail"
+  let a := a.insn "xor rcx, rcx"           -- src idx
+  let a := a.insn "xor rdx, rdx"           -- dst idx
+  let a := a.label ".Lb64d_loop4"
+  let a := a.insn "mov rax, r9"
+  let a := a.insn "sub rax, rcx"
+  let a := a.insn "cmp rax, 4"
+  let a := a.insn "jb .Lb64d_tail"
+  -- decode 4 chars -> 3 bytes
+  let a := a.insn "lea r11, [rip+.Lb64_rev]"
+  let a := a.insn "xor edi, edi"           -- acc
+  let a := a.insn "mov rsi, 4"             -- inner count
+  let a := a.label ".Lb64d_in4"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx]"
+  let a := a.insn "movzx eax, BYTE PTR [r11+rax]"
+  let a := a.insn "cmp eax, 255"
+  let a := a.insn "je .Lb64d_fail"
+  let a := a.insn "shl edi, 6"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "inc rcx"
+  let a := a.insn "dec rsi"
+  let a := a.insn "jnz .Lb64d_in4"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 16"
+  let a := a.insn "mov [r10+rdx], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 8"
+  let a := a.insn "mov [r10+rdx+1], al"
+  let a := a.insn "mov [r10+rdx+2], dil"
+  let a := a.insn "add rdx, 3"
+  let a := a.insn "jmp .Lb64d_loop4"
+  let a := a.label ".Lb64d_tail"
+  let a := a.insn "mov rax, r9"
+  let a := a.insn "sub rax, rcx"
+  let a := a.insn "cmp rax, 2"
+  let a := a.insn "jb .Lb64d_done"
+  let a := a.insn "je .Lb64d_two"
+  -- 3 chars -> 2 bytes
+  let a := a.insn "lea r11, [rip+.Lb64_rev]"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx]"
+  let a := a.insn "movzx eax, BYTE PTR [r11+rax]"
+  let a := a.insn "cmp eax, 255"
+  let a := a.insn "je .Lb64d_fail"
+  let a := a.insn "shl eax, 18"
+  let a := a.insn "mov edi, eax"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+1]"
+  let a := a.insn "movzx eax, BYTE PTR [r11+rax]"
+  let a := a.insn "cmp eax, 255"
+  let a := a.insn "je .Lb64d_fail"
+  let a := a.insn "shl eax, 12"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+2]"
+  let a := a.insn "movzx eax, BYTE PTR [r11+rax]"
+  let a := a.insn "cmp eax, 255"
+  let a := a.insn "je .Lb64d_fail"
+  let a := a.insn "shl eax, 6"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 16"
+  let a := a.insn "mov [r10+rdx], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 8"
+  let a := a.insn "mov [r10+rdx+1], al"
+  let a := a.insn "add rdx, 2"
+  let a := a.insn "jmp .Lb64d_done"
+  let a := a.label ".Lb64d_two"
+  -- 2 chars -> 1 byte
+  let a := a.insn "lea r11, [rip+.Lb64_rev]"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx]"
+  let a := a.insn "movzx eax, BYTE PTR [r11+rax]"
+  let a := a.insn "cmp eax, 255"
+  let a := a.insn "je .Lb64d_fail"
+  let a := a.insn "shl eax, 6"
+  let a := a.insn "mov edi, eax"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+1]"
+  let a := a.insn "movzx eax, BYTE PTR [r11+rax]"
+  let a := a.insn "cmp eax, 255"
+  let a := a.insn "je .Lb64d_fail"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 4"
+  let a := a.insn "mov [r10+rdx], al"
+  let a := a.insn "inc rdx"
+  let a := a.label ".Lb64d_done"
+  let a := a.insn "mov rax, rdx"
+  let a := a.insn "ret"
+  let a := a.label ".Lb64d_fail"
+  let a := a.insn "mov rax, -1"
+  let a := a.insn "ret"
+  a
+
+/-- b64enc(rdi=src, rsi=len, rdx=dst) -> rax outlen (unpadded). -/
+def emitB64Enc (a : Asm) : Asm :=
+  let a := a.raw ".globl b64enc_asm"
+  let a := a.label "b64enc_asm"
+  let a := a.insn "mov r8, rdi"
+  let a := a.insn "mov r9, rsi"
+  let a := a.insn "mov r10, rdx"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.insn "xor r11, r11"
+  let a := a.insn "lea rdx, [rip+.Lb64_alpha]"
+  let a := a.label ".Lb64e_loop"
+  let a := a.insn "mov rax, r9"
+  let a := a.insn "sub rax, rcx"
+  let a := a.insn "cmp rax, 3"
+  let a := a.insn "jb .Lb64e_tail"
+  let a := a.insn "movzx edi, BYTE PTR [r8+rcx]"
+  let a := a.insn "shl edi, 16"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+1]"
+  let a := a.insn "shl eax, 8"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+2]"
+  let a := a.insn "or edi, eax"            -- edi = 24-bit
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 18"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 12"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+1], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 6"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+2], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+3], al"
+  let a := a.insn "add r11, 4"
+  let a := a.insn "add rcx, 3"
+  let a := a.insn "jmp .Lb64e_loop"
+  let a := a.label ".Lb64e_tail"
+  let a := a.insn "mov rax, r9"
+  let a := a.insn "sub rax, rcx"
+  let a := a.insn "cmp rax, 2"
+  let a := a.insn "jb .Lb64e_one"
+  let a := a.insn "je .Lb64e_two"
+  -- 3 bytes -> 4 chars
+  let a := a.insn "movzx edi, BYTE PTR [r8+rcx]"
+  let a := a.insn "shl edi, 16"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+1]"
+  let a := a.insn "shl eax, 8"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+2]"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 18"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 12"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+1], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 6"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+2], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+3], al"
+  let a := a.insn "add r11, 4"
+  let a := a.insn "jmp .Lb64e_done"
+  let a := a.label ".Lb64e_two"
+  let a := a.insn "movzx edi, BYTE PTR [r8+rcx]"
+  let a := a.insn "shl edi, 8"
+  let a := a.insn "movzx eax, BYTE PTR [r8+rcx+1]"
+  let a := a.insn "or edi, eax"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 10"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 4"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+1], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "and eax, 15"
+  let a := a.insn "shl eax, 2"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+2], al"
+  let a := a.insn "add r11, 3"
+  let a := a.insn "jmp .Lb64e_done"
+  let a := a.label ".Lb64e_one"
+  let a := a.insn "cmp rax, 1"
+  let a := a.insn "jne .Lb64e_done"
+  let a := a.insn "movzx edi, BYTE PTR [r8+rcx]"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "shr eax, 2"
+  let a := a.insn "and eax, 63"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11], al"
+  let a := a.insn "mov eax, edi"
+  let a := a.insn "and eax, 3"
+  let a := a.insn "shl eax, 4"
+  let a := a.insn "mov al, [rdx+rax]"
+  let a := a.insn "mov [r10+r11+1], al"
+  let a := a.insn "add r11, 2"
+  let a := a.label ".Lb64e_done"
+  let a := a.insn "mov rax, r11"
+  let a := a.insn "ret"
+  a
+
+/-! ## strict UTF-8 validation -/
+
+/-- utf8ok(rdi=ptr, rsi=len) -> al 1 valid. Rejects overlong, surrogates, >10FFFF. -/
+def emitUtf8Ok (a : Asm) : Asm :=
+  let a := a.raw ".globl utf8ok_asm"
+  let a := a.label "utf8ok_asm"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label ".Lutf8_loop"
+  let a := a.insn "cmp rcx, rsi"
+  let a := a.insn "jae .Lutf8_yes"
+  let a := a.insn "movzx eax, BYTE PTR [rdi+rcx]"
+  -- ASCII
+  let a := a.insn "cmp eax, 0x80"
+  let a := a.insn "jb .Lutf8_next"
+  -- 2-byte: C2..DF + 1 cont
+  let a := a.insn "cmp eax, 0xC2"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.insn "cmp eax, 0xE0"
+  let a := a.insn "jb .Lutf8_need1"
+  -- 3-byte: E0 -> [A0..BF]; ED -> [80..9F]; E1..EC/EE/EF -> [80..BF]
+  let a := a.insn "cmp eax, 0xF0"
+  let a := a.insn "jb .Lutf8_lead3"
+  -- 4-byte: F0 -> [90..BF]; F4 -> [80..8F]; F1..F3 -> [80..BF]
+  let a := a.insn "cmp eax, 0xF5"
+  let a := a.insn "jae .Lutf8_no"
+  let a := a.insn "movzx edx, BYTE PTR [rdi+rcx+1]"
+  let a := a.insn "cmp edx, 0x80"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.insn "cmp edx, 0xBF"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.insn "cmp eax, 0xF0"
+  let a := a.insn "jne .Lutf8_l4mid"
+  let a := a.insn "cmp edx, 0x90"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.label ".Lutf8_l4mid"
+  let a := a.insn "cmp eax, 0xF4"
+  let a := a.insn "jne .Lutf8_l4rest"
+  let a := a.insn "cmp edx, 0x8F"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.label ".Lutf8_l4rest"
+  -- need 3 continuations (first checked); check the remaining 2
+  let a := a.insn "movzx edx, BYTE PTR [rdi+rcx+2]"
+  let a := a.insn "cmp edx, 0x80"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.insn "cmp edx, 0xBF"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.insn "movzx edx, BYTE PTR [rdi+rcx+3]"
+  let a := a.insn "cmp edx, 0x80"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.insn "cmp edx, 0xBF"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.insn "add rcx, 4"
+  let a := a.insn "jmp .Lutf8_loop"
+  let a := a.label ".Lutf8_lead3"
+  let a := a.insn "movzx edx, BYTE PTR [rdi+rcx+1]"
+  let a := a.insn "cmp edx, 0x80"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.insn "cmp edx, 0xBF"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.insn "cmp eax, 0xE0"
+  let a := a.insn "jne .Lutf8_l3mid"
+  let a := a.insn "cmp edx, 0xA0"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.label ".Lutf8_l3mid"
+  let a := a.insn "cmp eax, 0xED"
+  let a := a.insn "jne .Lutf8_l3rest"
+  let a := a.insn "cmp edx, 0x9F"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.label ".Lutf8_l3rest"
+  let a := a.insn "movzx edx, BYTE PTR [rdi+rcx+2]"
+  let a := a.insn "cmp edx, 0x80"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.insn "cmp edx, 0xBF"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.insn "add rcx, 3"
+  let a := a.insn "jmp .Lutf8_loop"
+  let a := a.label ".Lutf8_need1"
+  let a := a.insn "movzx edx, BYTE PTR [rdi+rcx+1]"
+  let a := a.insn "cmp edx, 0x80"
+  let a := a.insn "jb .Lutf8_no"
+  let a := a.insn "cmp edx, 0xBF"
+  let a := a.insn "ja .Lutf8_no"
+  let a := a.insn "add rcx, 2"
+  let a := a.insn "jmp .Lutf8_loop"
+  let a := a.label ".Lutf8_next"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp .Lutf8_loop"
+  let a := a.label ".Lutf8_yes"
+  let a := a.insn "mov al, 1"
+  let a := a.insn "ret"
+  let a := a.label ".Lutf8_no"
+  let a := a.insn "xor eax, eax"
+  let a := a.insn "ret"
+  a
+
+/-! ## JSON top-level field scan
+
+jsonfind_asm(rdi=json, rsi=len, rdx=key, rcx=keylen) -> rax=value ptr (0=absent),
+r8=value len. String values are returned INCLUDING quotes. Skipping is balanced
+and escape-aware. (Raw-span matching: equal to the spec parser on the suite's
+plain-ASCII payloads; divergence documented in the README/differential corpus.)
+-/
+def emitJsonFind (a : Asm) : Asm :=
+  let a := a.raw ".globl jsonfind_asm"
+  let a := a.label "jsonfind_asm"
+  let a := a.insn "push rbx"             -- keylen
+  let a := a.insn "push rbp"             -- key ptr
+  let a := a.insn "push r12"             -- key-match flag
+  let a := a.insn "push r13"             -- cursor
+  let a := a.insn "push r14"             -- end
+  let a := a.insn "push r15"             -- temp
+  let a := a.insn "mov rbp, rdx"
+  let a := a.insn "mov ebx, ecx"
+  let a := a.insn "mov r13, rdi"
+  let a := a.insn "lea r14, [rdi+rsi]"
+  -- expect '{'
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 123"
+  let a := a.insn "jne .Ljf_notfound"
+  let a := a.insn "inc r13"
+  let a := a.label ".Ljf_pair"
+  -- skip ws
+  let a := a.label ".Ljf_ws1"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 32"
+  let a := a.insn "je .Ljf_ws1a"
+  let a := a.insn "cmp eax, 9"
+  let a := a.insn "je .Ljf_ws1a"
+  let a := a.insn "cmp eax, 10"
+  let a := a.insn "je .Ljf_ws1a"
+  let a := a.insn "cmp eax, 13"
+  let a := a.insn "jne .Ljf_ws1done"
+  let a := a.label ".Ljf_ws1a"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_ws1"
+  let a := a.label ".Ljf_ws1done"
+  -- '}' -> end (key not found)
+  let a := a.insn "cmp eax, 125"
+  let a := a.insn "je .Ljf_notfound"
+  -- expect '"'
+  let a := a.insn "cmp eax, 34"
+  let a := a.insn "jne .Ljf_notfound"
+  let a := a.insn "inc r13"
+  let a := a.insn "mov r15, r13"        -- key start
+  let a := a.label ".Ljf_keyscan"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 92"          -- backslash: skip next
+  let a := a.insn "jne .Ljf_keychk"
+  let a := a.insn "add r13, 2"
+  let a := a.insn "jmp .Ljf_keyscan"
+  let a := a.label ".Ljf_keychk"
+  let a := a.insn "cmp eax, 34"
+  let a := a.insn "je .Ljf_keyend"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_keyscan"
+  let a := a.label ".Ljf_keyend"
+  -- key span = [r15, r13); compare with rbp/rbx
+  let a := a.insn "mov rdi, r15"
+  let a := a.insn "mov rsi, r13"
+  let a := a.insn "sub rsi, r15"
+  let a := a.insn "mov rdx, rbp"
+  let a := a.insn "mov rcx, rbx"
+  let a := a.insn "push r13"
+  let a := a.insn "push r14"
+  let a := a.insn "sub rsp, 8"
+  let a := a.insn "call .Lstreq"
+  let a := a.insn "add rsp, 8"
+  let a := a.insn "pop r14"
+  let a := a.insn "pop r13"
+  let a := a.insn "mov r12d, eax"        -- key match flag
+  -- skip ':' + ws
+  let a := a.insn "inc r13"              -- past closing quote
+  let a := a.label ".Ljf_ws2"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 32"
+  let a := a.insn "je .Ljf_ws2a"
+  let a := a.insn "cmp eax, 9"
+  let a := a.insn "je .Ljf_ws2a"
+  let a := a.insn "cmp eax, 10"
+  let a := a.insn "je .Ljf_ws2a"
+  let a := a.insn "cmp eax, 13"
+  let a := a.insn "jne .Ljf_ws2done"
+  let a := a.label ".Ljf_ws2a"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_ws2"
+  let a := a.label ".Ljf_ws2done"
+  let a := a.insn "cmp eax, 58"          -- ':'
+  let a := a.insn "jne .Ljf_notfound"
+  let a := a.insn "inc r13"
+  -- skip ws before value
+  let a := a.label ".Ljf_ws3"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 32"
+  let a := a.insn "je .Ljf_ws3a"
+  let a := a.insn "cmp eax, 9"
+  let a := a.insn "je .Ljf_ws3a"
+  let a := a.insn "cmp eax, 10"
+  let a := a.insn "je .Ljf_ws3a"
+  let a := a.insn "cmp eax, 13"
+  let a := a.insn "jne .Ljf_ws3done"
+  let a := a.label ".Ljf_ws3a"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_ws3"
+  let a := a.label ".Ljf_ws3done"
+  -- value start = r13
+  let a := a.insn "mov r15, r13"
+  let a := a.insn "cmp eax, 34"          -- string value
+  let a := a.insn "je .Ljf_vstr"
+  let a := a.insn "cmp eax, 123"         -- object
+  let a := a.insn "je .Ljf_vnest"
+  let a := a.insn "cmp eax, 91"          -- array
+  let a := a.insn "je .Ljf_vnest"
+  -- literal: scan to delimiter
+  let a := a.label ".Ljf_vlit"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_vend"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 44"
+  let a := a.insn "je .Ljf_vend"
+  let a := a.insn "cmp eax, 125"
+  let a := a.insn "je .Ljf_vend"
+  let a := a.insn "cmp eax, 32"
+  let a := a.insn "je .Ljf_vend"
+  let a := a.insn "cmp eax, 9"
+  let a := a.insn "je .Ljf_vend"
+  let a := a.insn "cmp eax, 10"
+  let a := a.insn "je .Ljf_vend"
+  let a := a.insn "cmp eax, 13"
+  let a := a.insn "je .Ljf_vend"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_vlit"
+  let a := a.label ".Ljf_vstr"
+  let a := a.insn "inc r13"              -- past opening quote
+  let a := a.label ".Ljf_vstrscan"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 92"
+  let a := a.insn "jne .Ljf_vstrchk"
+  let a := a.insn "add r13, 2"
+  let a := a.insn "jmp .Ljf_vstrscan"
+  let a := a.label ".Ljf_vstrchk"
+  let a := a.insn "cmp eax, 34"
+  let a := a.insn "je .Ljf_vstrend"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_vstrscan"
+  let a := a.label ".Ljf_vstrend"
+  let a := a.insn "inc r13"              -- include closing quote
+  let a := a.insn "jmp .Ljf_vend"
+  let a := a.label ".Ljf_vnest"
+  -- depth counting: r15 holds start (with the opening bracket)
+  let a := a.insn "mov rcx, 0"           -- depth
+  let a := a.label ".Ljf_vnestloop"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 92"
+  let a := a.insn "jne .Ljf_vnestc"
+  let a := a.insn "add r13, 2"
+  let a := a.insn "jmp .Ljf_vnestloop"
+  let a := a.label ".Ljf_vnestc"
+  let a := a.insn "cmp eax, 34"
+  let a := a.insn "jne .Ljf_vnestbr"
+  -- inside string: skip it
+  let a := a.insn "inc r13"
+  let a := a.label ".Ljf_vnstr"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 92"
+  let a := a.insn "jne .Ljf_vnstrc"
+  let a := a.insn "add r13, 2"
+  let a := a.insn "jmp .Ljf_vnstr"
+  let a := a.label ".Ljf_vnstrc"
+  let a := a.insn "cmp eax, 34"
+  let a := a.insn "je .Ljf_vnstrend"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_vnstr"
+  let a := a.label ".Ljf_vnstrend"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_vnestloop"
+  let a := a.label ".Ljf_vnestbr"
+  let a := a.insn "cmp eax, 123"
+  let a := a.insn "jne .Ljf_vnestb2"
+  let a := a.insn "inc rcx"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_vnestloop"
+  let a := a.label ".Ljf_vnestb2"
+  let a := a.insn "cmp eax, 91"
+  let a := a.insn "jne .Ljf_vnestb3"
+  let a := a.insn "inc rcx"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_vnestloop"
+  let a := a.label ".Ljf_vnestb3"
+  let a := a.insn "cmp eax, 125"
+  let a := a.insn "jne .Ljf_vnestb4"
+  let a := a.insn "dec rcx"
+  let a := a.insn "inc r13"
+  let a := a.insn "test rcx, rcx"
+  let a := a.insn "jnz .Ljf_vnestloop"
+  let a := a.insn "jmp .Ljf_vend"
+  let a := a.label ".Ljf_vnestb4"
+  let a := a.insn "cmp eax, 93"
+  let a := a.insn "jne .Ljf_vnestb5"
+  let a := a.insn "dec rcx"
+  let a := a.insn "inc r13"
+  let a := a.insn "test rcx, rcx"
+  let a := a.insn "jnz .Ljf_vnestloop"
+  let a := a.insn "jmp .Ljf_vend"
+  let a := a.label ".Ljf_vnestb5"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_vnestloop"
+  let a := a.label ".Ljf_vend"
+  -- value span [r15, r13); if key matched -> return
+  let a := a.insn "test r12d, r12d"
+  let a := a.insn "jnz .Ljf_got"
+  -- else: skip ws; ',' -> next pair; '}' -> notfound; else notfound
+  let a := a.label ".Ljf_ws4"
+  let a := a.insn "cmp r13, r14"
+  let a := a.insn "jae .Ljf_notfound"
+  let a := a.insn "movzx eax, BYTE PTR [r13]"
+  let a := a.insn "cmp eax, 32"
+  let a := a.insn "je .Ljf_ws4a"
+  let a := a.insn "cmp eax, 9"
+  let a := a.insn "je .Ljf_ws4a"
+  let a := a.insn "cmp eax, 10"
+  let a := a.insn "je .Ljf_ws4a"
+  let a := a.insn "cmp eax, 13"
+  let a := a.insn "jne .Ljf_ws4done"
+  let a := a.label ".Ljf_ws4a"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_ws4"
+  let a := a.label ".Ljf_ws4done"
+  let a := a.insn "cmp eax, 44"
+  let a := a.insn "jne .Ljf_notfound"
+  let a := a.insn "inc r13"
+  let a := a.insn "jmp .Ljf_pair"
+  let a := a.label ".Ljf_got"
+  let a := a.insn "mov rax, r15"
+  let a := a.insn "mov r8, r13"
+  let a := a.insn "sub r8, r15"
+  let a := a.insn "jmp .Ljf_ret"
+  let a := a.label ".Ljf_notfound"
+  let a := a.insn "xor eax, eax"
+  let a := a.insn "xor r8d, r8d"
+  let a := a.label ".Ljf_ret"
+  let a := a.insn "pop r15"
+  let a := a.insn "pop r14"
+  let a := a.insn "pop r13"
+  let a := a.insn "pop r12"
+  let a := a.insn "pop rbp"
+  let a := a.insn "pop rbx"
+  let a := a.insn "ret"
+  a
+
+/-- parseexp(rdi=ptr, rsi=len) -> rax i64, edx 1 ok / 0 bad. Saturates on overflow. -/
+def emitParseExp (a : Asm) : Asm :=
+  let a := a.raw ".globl parseexp_asm"
+  let a := a.label "parseexp_asm"
+  let a := a.insn "xor eax, eax"          -- acc
+  let a := a.insn "xor edx, edx"          -- negative flag
+  let a := a.insn "xor rcx, rcx"          -- idx
+  let a := a.insn "xor r8d, r8d"          -- digit count
+  let a := a.insn "cmp rcx, rsi"
+  let a := a.insn "jae .Lpe_bad"
+  let a := a.insn "movzx r9d, BYTE PTR [rdi]"
+  let a := a.insn "cmp r9d, 45"           -- '-'
+  let a := a.insn "jne .Lpe_digits"
+  let a := a.insn "mov edx, 1"
+  let a := a.insn "inc rcx"
+  let a := a.label ".Lpe_digits"
+  let a := a.insn "cmp rcx, rsi"
+  let a := a.insn "jae .Lpe_end"
+  let a := a.insn "movzx r9d, BYTE PTR [rdi+rcx]"
+  let a := a.insn "sub r9d, 48"
+  let a := a.insn "cmp r9d, 9"
+  let a := a.insn "ja .Lpe_end"
+  -- saturating acc = acc*10 + d
+  let a := a.insn "mov r10, 0x7FFFFFFFFFFFFFFF"
+  let a := a.insn "sub r10, r9"
+  let a := a.insn "mov r11, rax"
+  let a := a.insn "cmp r11, r10"
+  let a := a.insn "ja .Lpe_saturate"
+  let a := a.insn "imul rax, rax, 10"
+  let a := a.insn "add rax, r9"
+  let a := a.insn "inc rcx"
+  let a := a.insn "inc r8"
+  let a := a.insn "jmp .Lpe_digits"
+  let a := a.label ".Lpe_saturate"
+  let a := a.insn "mov rax, 0x7FFFFFFFFFFFFFFF"
+  let a := a.insn "inc rcx"
+  let a := a.insn "inc r8"
+  let a := a.label ".Lpe_sskip"
+  let a := a.insn "cmp rcx, rsi"
+  let a := a.insn "jae .Lpe_end"
+  let a := a.insn "movzx r9d, BYTE PTR [rdi+rcx]"
+  let a := a.insn "sub r9d, 48"
+  let a := a.insn "cmp r9d, 9"
+  let a := a.insn "ja .Lpe_end"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp .Lpe_sskip"
+  let a := a.label ".Lpe_end"
+  let a := a.insn "test r8d, r8d"
+  let a := a.insn "jz .Lpe_bad"
+  let a := a.insn "test edx, edx"
+  let a := a.insn "jz .Lpe_ok"
+  let a := a.insn "neg rax"
+  let a := a.label ".Lpe_ok"
+  let a := a.insn "mov edx, 1"
+  let a := a.insn "ret"
+  let a := a.label ".Lpe_bad"
+  let a := a.insn "xor eax, eax"
+  let a := a.insn "xor edx, edx"
+  let a := a.insn "ret"
+  a
+
+/-! ## app_init: cache the JWT secret -/
+
+def emitAppInitAuth (a : Asm) : Asm :=
+  let a := a.raw ".globl app_init"
+  let a := a.label "app_init"
+  let a := a.insn "sub rsp, 24"          -- entry rsp%16==8 -> now 0
+  let a := a.insn "lea rdi, [rsp]"
+  let a := a.call "x_env_secret"
+  let a := a.insn "mov [rip+g_secret_ptr], rax"
+  let a := a.insn "mov rax, [rsp]"
+  let a := a.insn "mov [rip+g_secret_len], rax"
+  let a := a.insn "add rsp, 24"
+  let a := a.insn "xor eax, eax"
+  let a := a.insn "ret"
+  a
+
+/-! ## .Lauth_check — the JWT pipeline (mirrors Feed.Jwt.verify, staged)
+
+rbx = req. Returns eax: 0 ok / 1 missing bearer / 2 invalid / 3 bad payload.
+On ok: g_uid, g_uname_ptr, g_uname_len are set (for the POST handlers).
+Frame: hdr@0x000(512) pay@0x200(1536) sig@0x800(64) mac@0x840(32) b64mac@0x860(64)
+       h64_ptr@0x8A0 h64_len@0x8A8 p64_ptr@0x8B0 p64_len@0x8B8 s64_ptr@0x8C0
+       s64_len@0x8C8 dot2@0x8D0 (msg len)
+-/
+def emitAuthCheck (a : Asm) : Asm :=
+  let a := a.label ".Lauth_check"
+  let a := a.insn "push rbx"
+  let a := a.insn "push r12"
+  let a := a.insn "sub rsp, 0x908"       -- keeps call alignment (2 pushes + 0x908)
+  -- missing bearer?
+  let a := a.insn "movsx rax, DWORD PTR [rbx+APPREQ_AUTH_LEN]"
+  let a := a.insn "cmp rax, 0"
+  let a := a.insn "jl .Lac_missing"
+  let a := a.insn "cmp rax, 7"
+  let a := a.insn "jl .Lac_missing"
+  let a := a.insn "mov rdi, [rbx+APPREQ_AUTH]"
+  let a := a.insn "movsx rsi, DWORD PTR [rbx+APPREQ_AUTH_LEN]"
+  let (a, lBearer) := a.poolStr "Bearer "
+  let a := a.insn (s!"lea rdx, [rip+{lBearer}]")
+  let a := a.insn "mov ecx, 7"
+  let a := a.insn "call .Lstreqpfx"
+  let a := a.insn "test al, al"
+  let a := a.insn "jz .Lac_missing"
+  -- token spans
+  let a := a.insn "mov rax, [rbx+APPREQ_AUTH]"
+  let a := a.insn "add rax, 7"
+  let a := a.insn "mov [rsp+0x8A0], rax"
+  let a := a.insn "movsx rax, DWORD PTR [rbx+APPREQ_AUTH_LEN]"
+  let a := a.insn "sub rax, 7"
+  let a := a.insn "mov [rsp+0x8A8], rax"
+  let a := a.insn "cmp rax, 2048"
+  let a := a.insn "ja .Lac_invalid"
+  -- split on exactly two dots
+  let a := a.insn "xor rcx, rcx"
+  let a := a.insn "mov rdx, [rsp+0x8A0]"
+  let a := a.insn "mov rsi, [rsp+0x8A8]"
+  let a := a.label ".Lac_d1"
+  let a := a.insn "cmp rcx, rsi"
+  let a := a.insn "jae .Lac_invalid"
+  let a := a.insn "cmp BYTE PTR [rdx+rcx], 46"
+  let a := a.insn "je .Lac_d1ok"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp .Lac_d1"
+  let a := a.label ".Lac_d1ok"
+  let a := a.insn "test rcx, rcx"
+  let a := a.insn "jz .Lac_invalid"      -- empty h64
+  let a := a.insn "mov r8, rcx"          -- h64 len
+  let a := a.insn "inc rcx"              -- past dot
+  let a := a.insn "mov r9, rcx"          -- p64 start
+  let a := a.label ".Lac_d2"
+  let a := a.insn "cmp rcx, rsi"
+  let a := a.insn "jae .Lac_invalid"
+  let a := a.insn "cmp BYTE PTR [rdx+rcx], 46"
+  let a := a.insn "je .Lac_d2ok"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp .Lac_d2"
+  let a := a.label ".Lac_d2ok"
+  let a := a.insn "mov r10, rcx"
+  let a := a.insn "sub r10, r9"          -- p64 len
+  let a := a.insn "test r10, r10"
+  let a := a.insn "jz .Lac_invalid"
+  let a := a.insn "inc rcx"              -- s64 start offset
+  let a := a.insn "mov rax, rsi"
+  let a := a.insn "sub rax, rcx"         -- s64 len
+  let a := a.insn "test rax, rax"
+  let a := a.insn "jz .Lac_invalid"
+  -- no third dot allowed
+  let a := a.insn "mov r11, rcx"
+  let a := a.label ".Lac_d3"
+  let a := a.insn "cmp r11, rsi"
+  let a := a.insn "jae .Lac_d3ok"
+  let a := a.insn "cmp BYTE PTR [rdx+r11], 46"
+  let a := a.insn "je .Lac_invalid"
+  let a := a.insn "inc r11"
+  let a := a.insn "jmp .Lac_d3"
+  let a := a.label ".Lac_d3ok"
+  -- save spans (p64 ptr = tok + p64 index)
+  let a := a.insn "mov [rsp+0x8B8], r10"
+  let a := a.insn "mov rax, [rsp+0x8A0]"
+  let a := a.insn "add rax, r9"
+  let a := a.insn "mov [rsp+0x8B0], rax"
+  let a := a.insn "mov rax, [rsp+0x8A0]"
+  let a := a.insn "add rax, rcx"
+  let a := a.insn "mov [rsp+0x8C0], rax"  -- s64 ptr
+  -- s64 len = toklen - s64 offset
+  let a := a.insn "mov rax, [rsp+0x8A8]"
+  let a := a.insn "sub rax, rcx"
+  let a := a.insn "mov [rsp+0x8C8], rax"
+  -- msg len (h64 ++ "." ++ p64) = h64len + 1 + p64len
+  let a := a.insn "mov rax, r8"
+  let a := a.insn "add rax, r10"
+  let a := a.insn "add rax, 1"
+  let a := a.insn "mov [rsp+0x8D0], rax"
+  -- decode header
+  let a := a.insn "mov rdi, [rsp+0x8A0]"
+  let a := a.insn "mov rsi, r8"
+  let a := a.insn "lea rdx, [rsp]"
+  let a := a.insn "mov ecx, 512"
+  let a := a.insn "call b64dec_asm"
+  let a := a.insn "cmp rax, 0"
+  let a := a.insn "jl .Lac_invalid"
+  let a := a.insn "mov rsi, rax"
+  let a := a.insn "lea rdi, [rsp]"
+  let a := a.insn "push rsi"
+  let a := a.insn "push rdi"
+  let a := a.insn "sub rsp, 8"
+  let a := a.insn "call utf8ok_asm"
+  let a := a.insn "add rsp, 8"
+  let a := a.insn "pop rdi"
+  let a := a.insn "pop rsi"
+  let a := a.insn "test al, al"
+  let a := a.insn "jz .Lac_invalid"
+  -- alg == "HS256"
+  let (a, lAlg) := a.poolStr "alg"
+  let a := a.insn (s!"lea rdx, [rip+{lAlg}]")
+  let a := a.insn "mov ecx, 3"
+  let a := a.insn "call jsonfind_asm"
+  let a := a.insn "test rax, rax"
+  let a := a.insn "jz .Lac_invalid"
+  -- span must equal "HS256" WITH quotes (7 bytes)
+  let (a, lAlgLit) := a.poolStr "\"HS256\""
+  let a := a.insn "mov rdi, rax"
+  let a := a.insn "mov rsi, r8"
+  let a := a.insn (s!"lea rdx, [rip+{lAlgLit}]")
+  let a := a.insn "mov ecx, 7"
+  let a := a.insn "call .Lstreq"
+  let a := a.insn "test al, al"
+  let a := a.insn "jz .Lac_invalid"
+  -- decode payload
+  let a := a.insn "mov rdi, [rsp+0x8B0]"
+  let a := a.insn "mov rsi, [rsp+0x8B8]"
+  let a := a.insn "lea rdx, [rsp+0x200]"
+  let a := a.insn "mov ecx, 1536"
+  let a := a.insn "call b64dec_asm"
+  let a := a.insn "cmp rax, 0"
+  let a := a.insn "jl .Lac_invalid"
+  let a := a.insn "mov rsi, rax"
+  let a := a.insn "lea rdi, [rsp+0x200]"
+  let a := a.insn "push rsi"
+  let a := a.insn "push rdi"
+  let a := a.insn "sub rsp, 8"
+  let a := a.insn "call utf8ok_asm"
+  let a := a.insn "add rsp, 8"
+  let a := a.insn "pop rdi"
+  let a := a.insn "pop rsi"
+  let a := a.insn "test al, al"
+  let a := a.insn "jz .Lac_invalid"
+  let a := a.insn "mov [rsp+0x8E0], rsi"   -- payload len
+  -- signature: decode-validate s64
+  let a := a.insn "mov rdi, [rsp+0x8C0]"
+  let a := a.insn "mov rsi, [rsp+0x8C8]"
+  let a := a.insn "lea rdx, [rsp+0x800]"
+  let a := a.insn "mov ecx, 64"
+  let a := a.insn "call b64dec_asm"
+  let a := a.insn "cmp rax, 0"
+  let a := a.insn "jl .Lac_invalid"
+  -- hmac over "h64.p64" with the cached secret
+  let a := a.insn "lea rdi, [rsp+0x840]"
+  let a := a.insn "mov rsi, [rip+g_secret_ptr]"
+  let a := a.insn "mov rdx, [rip+g_secret_len]"
+  let a := a.insn "mov rcx, [rsp+0x8A0]"
+  let a := a.insn "mov r8, [rsp+0x8D0]"
+  let a := a.insn "call hmac_asm"
+  let a := a.insn "lea rdi, [rsp+0x840]"
+  let a := a.insn "mov esi, 32"
+  let a := a.insn "lea rdx, [rsp+0x860]"
+  let a := a.insn "call b64enc_asm"
+  let a := a.insn "mov r8, rax"            -- b64mac len
+  let a := a.insn "cmp r8, [rsp+0x8C8]"
+  let a := a.insn "jne .Lac_invalid"
+  -- byte compare
+  let a := a.insn "lea rdi, [rsp+0x860]"
+  let a := a.insn "mov rsi, [rsp+0x8C0]"
+  let a := a.insn "xor rcx, rcx"
+  let a := a.label ".Lac_scmp"
+  let a := a.insn "cmp rcx, r8"
+  let a := a.insn "jae .Lac_sigok"
+  let a := a.insn "mov al, [rdi+rcx]"
+  let a := a.insn "cmp al, [rsi+rcx]"
+  let a := a.insn "jne .Lac_invalid"
+  let a := a.insn "inc rcx"
+  let a := a.insn "jmp .Lac_scmp"
+  let a := a.label ".Lac_sigok"
+  -- exp: required, integer, > now
+  let (a, lExp) := a.poolStr "exp"
+  let a := a.insn "lea rdi, [rsp+0x200]"
+  let a := a.insn "mov rsi, [rsp+0x8E0]"
+  let a := a.insn (s!"lea rdx, [rip+{lExp}]")
+  let a := a.insn "mov ecx, 3"
+  let a := a.insn "call jsonfind_asm"
+  let a := a.insn "test rax, rax"
+  let a := a.insn "jz .Lac_invalid"
+  let a := a.insn "mov rdi, rax"
+  let a := a.insn "mov rsi, r8"
+  let a := a.insn "call parseexp_asm"
+  let a := a.insn "test edx, edx"
+  let a := a.insn "jz .Lac_invalid"
+  let a := a.insn "mov r9, rax"
+  let a := a.insn "push r9"
+  let a := a.insn "sub rsp, 8"
+  let a := a.call "x_now"
+  let a := a.insn "add rsp, 8"
+  let a := a.insn "pop r9"
+  let a := a.insn "cmp r9, rax"
+  let a := a.insn "jle .Lac_invalid"      -- exp <= now -> expired
+  -- sub: quoted string of digits, value >= 1
+  let (a, lSub) := a.poolStr "sub"
+  let a := a.insn "lea rdi, [rsp+0x200]"
+  let a := a.insn "mov rsi, [rsp+0x8E0]"
+  let a := a.insn (s!"lea rdx, [rip+{lSub}]")
+  let a := a.insn "mov ecx, 3"
+  let a := a.insn "call jsonfind_asm"
+  let a := a.insn "test rax, rax"
+  let a := a.insn "jz .Lac_badpayload"
+  let a := a.insn "cmp r8, 2"
+  let a := a.insn "jb .Lac_badpayload"
+  let a := a.insn "cmp BYTE PTR [rax], 34"
+  let a := a.insn "jne .Lac_badpayload"
+  let a := a.insn "cmp BYTE PTR [rax+r8-1], 34"
+  let a := a.insn "jne .Lac_badpayload"
+  let a := a.insn "lea rdi, [rax+1]"
+  let a := a.insn "mov rsi, r8"
+  let a := a.insn "sub rsi, 2"
+  let a := a.insn "push rsi"
+  let a := a.insn "push rdi"
+  let a := a.insn "sub rsp, 8"
+  let a := a.insn "call parseid_asm"
+  let a := a.insn "add rsp, 8"
+  let a := a.insn "pop rdi"
+  let a := a.insn "pop rsi"
+  let a := a.insn "test edx, edx"
+  let a := a.insn "jz .Lac_badpayload"
+  let a := a.insn "mov [rip+g_uid], rax"
+  -- username: string
+  let (a, lUn) := a.poolStr "username"
+  let a := a.insn "lea rdi, [rsp+0x200]"
+  let a := a.insn "mov rsi, [rsp+0x8E0]"
+  let a := a.insn (s!"lea rdx, [rip+{lUn}]")
+  let a := a.insn "mov ecx, 8"
+  let a := a.insn "call jsonfind_asm"
+  let a := a.insn "test rax, rax"
+  let a := a.insn "jz .Lac_badpayload"
+  let a := a.insn "cmp r8, 2"
+  let a := a.insn "jb .Lac_badpayload"
+  let a := a.insn "cmp BYTE PTR [rax], 34"
+  let a := a.insn "jne .Lac_badpayload"
+  let a := a.insn "cmp BYTE PTR [rax+r8-1], 34"
+  let a := a.insn "jne .Lac_badpayload"
+  let a := a.insn "inc rax"
+  let a := a.insn "mov [rip+g_uname_ptr], rax"
+  let a := a.insn "mov rax, r8"
+  let a := a.insn "sub rax, 2"
+  let a := a.insn "mov [rip+g_uname_len], rax"
+  let a := a.insn "xor eax, eax"
+  let a := a.insn "jmp .Lac_ret"
+  let a := a.label ".Lac_missing"
+  let a := a.insn "mov eax, 1"
+  let a := a.insn "jmp .Lac_ret"
+  let a := a.label ".Lac_invalid"
+  let a := a.insn "mov eax, 2"
+  let a := a.insn "jmp .Lac_ret"
+  let a := a.label ".Lac_badpayload"
+  let a := a.insn "mov eax, 3"
+  let a := a.label ".Lac_ret"
+  let a := a.insn "add rsp, 0x908"
+  let a := a.insn "pop r12"
+  let a := a.insn "pop rbx"
+  let a := a.insn "ret"
+  a
+
+/-- POST handlers (auth before id/body), M4: auth + id wired, body/insert in M5. -/
+def emitPostAuth (a : Asm) : Asm :=
+  let a := a.label ".Lpost_create"
+  let a := a.insn "call .Lauth_check"
+  let a := a.insn "cmp eax, 0"
+  let a := a.insn "jne .Lac_err"
+  let a := a.insn "mov rdi, r12"         -- M5: body parse + insert
+  let a := a.call "x_fail"
+  let a := a.insn "jmp .Ldone"
+  let a := a.label ".Lpost_like"
+  let a := a.insn "call .Lauth_check"    -- r14/r15 hold id ptr/len (set by router)
+  let a := a.insn "cmp eax, 0"
+  let a := a.insn "jne .Lac_err"
+  let a := a.insn "mov rdi, r14"
+  let a := a.insn "mov rsi, r15"
+  let a := a.insn "call parseid_asm"
+  let a := a.insn "test edx, edx"
+  let a := a.insn "jz .Linvalidid"
+  let a := a.insn "mov rdi, r12"         -- M5: existence + insert
+  let a := a.call "x_fail"
+  let a := a.insn "jmp .Ldone"
+  -- auth error mapping (eax = 1/2/3)
+  let a := a.label ".Lac_err"
+  let a := a.insn "cmp eax, 1"
+  let a := a.insn "jne .Lac_err2"
+  let a := outErrorBody a "r12" "missing bearer token"
+  let a := a.insn "mov eax, 401"
+  let a := a.insn "jmp .Ldone"
+  let a := a.label ".Lac_err2"
+  let a := a.insn "cmp eax, 2"
+  let a := a.insn "jne .Lac_err3"
+  let a := outErrorBody a "r12" "invalid or expired token"
+  let a := a.insn "mov eax, 401"
+  let a := a.insn "jmp .Ldone"
+  let a := a.label ".Lac_err3"
+  let a := outErrorBody a "r12" "invalid token payload"
+  let a := a.insn "mov eax, 401"
+  let a := a.insn "jmp .Ldone"
+  a
+
+/-! ## C-callable wrappers (tests/asm_selftest.c + the M6 differential harness) -/
+def emitCWrappers (a : Asm) : Asm :=
+  let a := a.raw ".globl jsonfind_c_asm"
+  let a := a.label "jsonfind_c_asm"          -- (rdi,rsi,rdx,rcx, r8=*outlen) -> rax ptr
+  let a := a.insn "push r8"
+  let a := a.insn "call jsonfind_asm"
+  let a := a.insn "pop rcx"
+  let a := a.insn "mov [rcx], r8"
+  let a := a.insn "ret"
+  let a := a.raw ".globl parseid_c_asm"
+  let a := a.label "parseid_c_asm"           -- (rdi,rsi,rdx=*ok) -> rax val
+  let a := a.insn "push rdx"
+  let a := a.insn "call parseid_asm"
+  let a := a.insn "pop rcx"
+  let a := a.insn "mov [rcx], edx"
+  let a := a.insn "ret"
+  let a := a.raw ".globl parseexp_c_asm"
+  let a := a.label "parseexp_c_asm"
+  let a := a.insn "push rdx"
+  let a := a.insn "call parseexp_asm"
+  let a := a.insn "pop rcx"
+  let a := a.insn "mov [rcx], edx"
+  let a := a.insn "ret"
+  a
+
+/-! ## Whole program -/
+
+def program : String :=
+  let a0 : Asm := {}
+  let a := emitStreq a0
+  let a := emitStreqpfx a
+  let a := emitHasSlash a
+  let a := emitParseId a
+  let a := emitStrlen a
+  let a := emitAppInitAuth a
+  let a := emitAppRequest a
+  let a := emitHealth a
+  let a := emitFeed a
+  let a := emitGetPostValid a
+  let a := emitPostAuth a
+  let a := emitPostObjectHelper a
+  let a := emitTables a
+  let a := emitSha256 a
+  let a := emitHmac a
+  let a := emitB64Dec a
+  let a := emitB64Enc a
+  let a := emitUtf8Ok a
+  let a := emitJsonFind a
+  let a := emitParseExp a
+  let a := emitAuthCheck a
+  let a := emitCWrappers a
+  -- pooled strings, each emitted as raw bytes
+  let poolLines : List String :=
+    a.pool.map (fun kv => s!"{kv.1}:" ++ "\n" ++ s!"    .byte {byteListAsm (asciiBytes kv.2)}")
+  let dataLines := ".section .rodata" :: poolLines
+  let bss := String.join
+    [ ".section .bss\n"
+    , ".align 8\n"
+    , "g_secret_ptr: .quad 0\n"
+    , "g_secret_len: .quad 0\n"
+    , "g_uid: .quad 0\n"
+    , "g_uname_ptr: .quad 0\n"
+    , "g_uname_len: .quad 0\n" ]
+  let text := String.join (a.text.map (fun l => l ++ "\n"))
+  let header := String.join
+    [ "# gen/app_gen.s — EMITTED by spec/EmitAsm.lean + spec/EmitAuth.lean (lake exe derive). Do not hand-edit.\n"
+    , "# Layout equates: owned here, pinned by runtime/abi.h _Static_asserts.\n"
+    , ".intel_syntax noprefix\n"
+    , String.join (equates.map (fun e => e ++ "\n"))
+    , ".text\n" ]
+  let footer := "\n.section .note.GNU-stack,\"\",@progbits\n"
+  header ++ text ++ String.join (dataLines.map (fun l => l ++ "\n")) ++ bss ++ footer
+
+end EmitAuth

@@ -105,30 +105,31 @@ def emitStreq (a : Asm) : Asm :=
 -- parseid(rdi=ptr, rsi=len) -> rax = value, edx = 1 valid | 0 invalid
 -- mirrors Feed.parseId exactly: digits-only, value >= 1, i64 overflow -> invalid
 def emitParseId (a : Asm) : Asm :=
-  let a := a.label ".Lparseid"
+  let a := a.raw ".globl parseid_asm"
+  let a := a.label "parseid_asm"
   let a := a.insn "test rsi, rsi"
-  let a := a.insn "jz .Lparseid_bad"
+  let a := a.insn "jz parseid_asm_bad"
   let a := a.insn "xor eax, eax"
   let a := a.insn "xor rcx, rcx"
-  let a := a.label ".Lparseid_loop"
+  let a := a.label "parseid_asm_loop"
   let a := a.insn "cmp rcx, rsi"
-  let a := a.insn "jae .Lparseid_done"
+  let a := a.insn "jae parseid_asm_done"
   let a := a.insn "movzx r8d, BYTE PTR [rdi+rcx]"
   let a := a.insn "sub r8d, 48"
   let a := a.insn "cmp r8d, 9"
-  let a := a.insn "ja .Lparseid_bad"
+  let a := a.insn "ja parseid_asm_bad"
   let a := a.insn "imul rax, rax, 10"
-  let a := a.insn "jo .Lparseid_bad"
+  let a := a.insn "jo parseid_asm_bad"
   let a := a.insn "add rax, r8"
-  let a := a.insn "jo .Lparseid_bad"
+  let a := a.insn "jo parseid_asm_bad"
   let a := a.insn "inc rcx"
-  let a := a.insn "jmp .Lparseid_loop"
-  let a := a.label ".Lparseid_done"
+  let a := a.insn "jmp parseid_asm_loop"
+  let a := a.label "parseid_asm_done"
   let a := a.insn "test rax, rax"
-  let a := a.insn "jz .Lparseid_bad"
+  let a := a.insn "jz parseid_asm_bad"
   let a := a.insn "mov edx, 1"
   let a := a.insn "ret"
-  let a := a.label ".Lparseid_bad"
+  let a := a.label "parseid_asm_bad"
   let a := a.insn "xor eax, eax"
   let a := a.insn "xor edx, edx"
   let a := a.insn "ret"
@@ -361,14 +362,6 @@ def emitFeed (a : Asm) : Asm :=
   let a := a.insn "jmp .Ldone"
   a
 
-/-- POST routes — auth lands in M4; M2 stub. -/
-def emitPost (a : Asm) : Asm :=
-  let a := a.label ".Lpost"
-  let a := a.insn "mov rdi, r12"
-  let a := a.call "x_fail"
-  let a := a.insn "jmp .Ldone"
-  a
-
 /-! ## app_request: routing (mirrors Model.handle) -/
 
 def emitAppRequest (a : Asm) : Asm :=
@@ -428,13 +421,56 @@ def emitAppRequest (a : Asm) : Asm :=
   let a := a.insn "add rdi, 7"
   let a := a.insn "mov esi, [rbx+APPREQ_PATH_LEN]"
   let a := a.insn "sub esi, 7"
-  let a := a.insn "call .Lparseid"
+  let a := a.insn "call parseid_asm"
   let a := a.insn "test edx, edx"
   let a := a.insn "jz .Linvalidid"
   let a := a.insn "jmp .Lgetpost"             -- M3: row fetch; M2 stub 500
-  -- POST (M2: everything stub)
+  -- POST: /posts -> create ; /posts/:id/like -> like (auth BEFORE id)
   let a := a.label ".Lroute_post"
-  let a := a.insn "jmp .Lpost"
+  let a := a.insn "mov rdi, [rbx+APPREQ_PATH]"
+  let a := a.insn "mov esi, [rbx+APPREQ_PATH_LEN]"
+  let (a, lPosts) := a.poolStr "/posts"
+  let a := a.insn (s!"lea rdx, [rip+{lPosts}]")
+  let a := a.insn "mov ecx, 6"
+  let a := a.insn "call .Lstreq"
+  let a := a.insn "test al, al"
+  let a := a.insn "jnz .Lpost_create"
+  let a := a.insn "mov rdi, [rbx+APPREQ_PATH]"
+  let a := a.insn "mov esi, [rbx+APPREQ_PATH_LEN]"
+  let (a, lPostsSlash) := a.poolStr "/posts/"
+  let a := a.insn (s!"lea rdx, [rip+{lPostsSlash}]")
+  let a := a.insn "mov ecx, 7"
+  let a := a.insn "call .Lstreqpfx"
+  let a := a.insn "test al, al"
+  let a := a.insn "jz .Lnotfound"
+  let a := a.insn "mov rax, [rbx+APPREQ_PATH_LEN]"
+  let a := a.insn "sub eax, 7"
+  let a := a.insn "cmp eax, 6"          -- at least 1 id char + "/like"
+  let a := a.insn "jb .Lnotfound"
+  let a := a.insn "mov ecx, eax"        -- restlen
+  let a := a.insn "mov rdx, [rbx+APPREQ_PATH]"
+  let a := a.insn "lea r8, [rdx+rcx+2]"  -- last-5 start: path+7 + restlen-5 = path+rcx+2
+  let a := a.insn "mov rdi, r8"
+  let a := a.insn "mov esi, 5"
+  let (a, lLike) := a.poolStr "/like"
+  let a := a.insn (s!"lea rdx, [rip+{lLike}]")
+  let a := a.insn "mov ecx, 5"
+  let a := a.insn "call .Lstreq"
+  let a := a.insn "test al, al"
+  let a := a.insn "jz .Lnotfound"
+  let a := a.insn "mov rdi, [rbx+APPREQ_PATH]"
+  let a := a.insn "add rdi, 7"
+  let a := a.insn "mov rsi, [rbx+APPREQ_PATH_LEN]"
+  let a := a.insn "sub esi, 7"
+  let a := a.insn "sub esi, 5"          -- idlen = restlen-5
+  let a := a.insn "call .Lhas_slash"
+  let a := a.insn "test al, al"
+  let a := a.insn "jnz .Lnotfound"
+  let a := a.insn "mov r14, [rbx+APPREQ_PATH]"
+  let a := a.insn "add r14, 7"
+  let a := a.insn "mov r15d, [rbx+APPREQ_PATH_LEN]"
+  let a := a.insn "sub r15d, 12"        -- 7 prefix + 5 suffix
+  let a := a.insn "jmp .Lpost_like"
   -- error responses
   let a := a.label ".Lnotfound"
   let a := outErrorBody a "r12" "not found"
@@ -511,36 +547,5 @@ def emitAppInit (a : Asm) : Asm :=
   let a := a.insn "xor eax, eax"
   let a := a.insn "ret"
   a
-
-/-! ## Whole program -/
-
-def program : String :=
-  let a0 : Asm := {}
-  -- helpers + handlers + entry
-  let a := emitStreq a0
-  let a := emitStreqpfx a
-  let a := emitHasSlash a
-  let a := emitParseId a
-  let a := emitStrlen a
-  let a := emitAppInit a
-  let a := emitAppRequest a
-  let a := emitPostObjectHelper a
-  let a := emitHealth a
-  let a := emitFeed a
-  let a := emitGetPostValid a
-  let a := emitPost a
-  -- pooled strings used by handlers, each emitted as raw bytes
-  let poolLines : List String :=
-    a.pool.map (fun kv => s!"{kv.1}:" ++ "\n" ++ s!"    .byte {byteListAsm (asciiBytes kv.2)}")
-  let dataLines := ".section .rodata" :: poolLines
-  let text := String.join (a.text.map (fun l => l ++ "\n"))
-  let header := String.join
-    [ "# gen/app_gen.s — EMITTED by spec/EmitAsm.lean (lake exe derive). Do not hand-edit.\n"
-    , "# Layout equates: owned here, pinned by runtime/abi.h _Static_asserts.\n"
-    , ".intel_syntax noprefix\n"
-    , String.join (equates.map (fun e => e ++ "\n"))
-    , ".text\n" ]
-  let footer := "\n.section .note.GNU-stack,\"\",@progbits\n"
-  header ++ text ++ String.join (dataLines.map (fun l => l ++ "\n")) ++ footer
 
 end EmitAsm
