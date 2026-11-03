@@ -7,6 +7,8 @@
 
 struct conn {
   int fd;
+  uint32_t gen;       /* stale-cqe guard (bumped on close/reuse) */
+  uint32_t last_tick; /* idle sweep stamp */
   char *rbuf;         /* request bytes */
   size_t rlen, rcap;
   char *wbuf;         /* pending response bytes */

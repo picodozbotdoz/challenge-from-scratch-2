@@ -102,13 +102,15 @@ int uring_get_cqe(uring_t *u, struct io_uring_cqe *out) {
   return 0;
 }
 
-/* blocking wait for one completion */
+/* blocking wait for one completion; returns 0 = cqe ready, 1 = interrupted by
+ * a signal (caller may retry — its handlers have usually run), -1 = error */
 int uring_wait(uring_t *u, struct io_uring_cqe *out) {
-  for (;;) {
-    if (uring_get_cqe(u, out) == 0) return 0;
-    int n = sys_io_uring_enter(u->fd, 0, 1, IORING_ENTER_GETEVENTS);
-    if (n < 0 && errno != EINTR && errno != EAGAIN) return -1;
-  }
+  if (uring_get_cqe(u, out) == 0) return 0;
+  int n = sys_io_uring_enter(u->fd, 0, 1, IORING_ENTER_GETEVENTS);
+  if (n < 0 && errno == EINTR) return 1;
+  if (n < 0 && errno != EAGAIN) return -1;
+  if (uring_get_cqe(u, out) == 0) return 0;
+  return -EAGAIN;                        /* spurious wakeup: caller retries */
 }
 
 void uring_cq_advance(uring_t *u, uint32_t n) {

@@ -16,7 +16,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <unistd.h>
+#include <time.h>
+#include <sys/time.h>
+#include <signal.h>
+static volatile sig_atomic_t g_sweep = 0;
+static void on_alarm(int sig) { (void)sig; g_sweep = 1; }
 
 #define MAXCONN 16384
 #define RBUF_INIT 4096
@@ -25,14 +31,23 @@
 static uring_t ring;
 static int listener_fd = -1;
 
-enum { OP_ACCEPT = 1, OP_READ, OP_WRITE };
-static uint64_t ud(int op, int slot) { return ((uint64_t)op << 56) | (uint32_t)slot; }
+enum { OP_ACCEPT = 1, OP_READ, OP_WRITE, OP_TIMER };
+static uint32_t g_tick = 0;
 static int ud_op(uint64_t x) { return (int)(x >> 56); }
-static int ud_slot(uint64_t x) { return (int)(x & 0xffffffff); }
+static int ud_slot(uint64_t x) { return (int)(x & 0xffffff); }
+static uint32_t ud_gen(uint64_t x) { return (uint32_t)(x >> 24) & 0xffffffff; }
+
+/* idle sweep: keep-alive idle connections >= IDLE_MAX_TICKS ticks are closed
+ * (>= 65 s required; we default to 8 x 10 s = 80 s) */
+static int g_tick_secs = 10;
+static int g_idle_max_ticks = 8;
 
 static struct conn conns[MAXCONN];   /* slot 0 unused (fd 0 marks free) */
 static int free_slots[MAXCONN];
 static int free_top = -1;
+static uint64_t ud(int op, int slot) {
+  return ((uint64_t)op << 56) | ((uint64_t)conns[slot].gen << 24) | (uint32_t)slot;
+}
 
 int db_open(const char *path);
 void db_close(void);
@@ -74,16 +89,45 @@ static void arm_write(struct conn *c, int slot) {
 }
 
 static void conn_close(struct conn *c) {
-  if (c->fd > 0) close(c->fd);
+  if (c->fd > 0) {
+    /* a pending ring read pins the fd: shutdown unblocks it so close reclaims */
+    shutdown(c->fd, SHUT_RDWR);
+    close(c->fd);
+  }
   free(c->rbuf); free(c->wbuf);
   int slot = (int)(c - conns);
+  uint32_t gen = c->gen + 1;      /* stale in-flight cqes for this slot */
   memset(c, 0, sizeof *c);
+  c->gen = gen;
   free_slots[++free_top] = slot;
 }
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
   setvbuf(stdout, NULL, _IOLBF, 0);
+
+  /* fd headroom for ~15k connections */
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur < rl.rlim_max) {
+    rl.rlim_cur = rl.rlim_max;
+    setrlimit(RLIMIT_NOFILE, &rl);
+  }
+  {
+    const char *ts = getenv("FEED_TICK_SECS");
+    const char *mt = getenv("FEED_IDLE_TICKS");
+    if (ts) g_tick_secs = atoi(ts);
+    if (mt) g_idle_max_ticks = atoi(mt);
+  }
+
+  {
+    struct sigaction sa = {0};
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = {0};
+    it.it_interval.tv_sec = (time_t)g_tick_secs;
+    it.it_value.tv_sec = (time_t)g_tick_secs;
+    setitimer(ITIMER_REAL, &it, NULL);
+  }
 
   const char *db_path = getenv("SQLITE_PATH");
   const char *host = getenv("HOST");
@@ -124,8 +168,21 @@ int main(void) {
   uring_submit(&ring);
 
   for (;;) {
+    if (g_sweep) {
+      g_sweep = 0;
+      g_tick++;
+      for (int i = 1; i < MAXCONN; i++) {
+        struct conn *c = &conns[i];
+        if (c->fd && g_tick - c->last_tick >= (uint32_t)g_idle_max_ticks)
+          conn_close(c);
+      }
+    }
     struct io_uring_cqe cqe;
-    if (uring_wait(&ring, &cqe) < 0) { perror("enter"); break; }
+    {
+      int w = uring_wait(&ring, &cqe);
+      if (w < 0) { perror("enter"); break; }
+      if (w == 1) continue;               /* signal: re-run the sweep check */
+    }
     int budget = 64;   /* process a batch without blocking on enter */
     for (;;) {
       int op = ud_op(cqe.user_data), slot = ud_slot(cqe.user_data);
@@ -136,6 +193,7 @@ int main(void) {
             memset(c, 0, sizeof *c);
             c->fd = cqe.res;
             c->keep_alive = 1;
+            c->last_tick = g_tick;
             c->rbuf = malloc(RBUF_INIT);
             c->rcap = RBUF_INIT;
             int nd = 1; setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof nd);
@@ -147,7 +205,10 @@ int main(void) {
         arm_accept();
       } else {
         struct conn *c = &conns[slot];
-        if (op == OP_READ) {
+        if (!c->fd || c->gen != ud_gen(cqe.user_data)) {
+          /* stale cqe for a closed/reused slot: drop */
+        } else if (op == OP_READ) {
+          c->last_tick = g_tick;
           if (cqe.res <= 0) {
             conn_close(c);
           } else {
@@ -182,6 +243,7 @@ int main(void) {
             else arm_write(c, slot);
           }
         } else if (op == OP_WRITE) {
+          c->last_tick = g_tick;
           if (cqe.res < 0) {
             conn_close(c);
           } else {

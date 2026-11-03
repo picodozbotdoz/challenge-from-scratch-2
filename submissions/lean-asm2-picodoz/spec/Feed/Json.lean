@@ -141,35 +141,38 @@ mutual
 private partial def parseNum (neg : Bool) (p : P) : Option (Json × P) :=
   let digits := p.takeWhile isDigitC
   if digits.isEmpty then none
+  else if digits.length > 1 && digits.head? == some '0' then none  -- no leading zeros
   else
     let intVal := digits.foldl (fun acc c => acc * 10 + (digitVal c).get!) 0
     let r1 := p.drop digits.length
-    match r1 with
-    | '.' :: _ | 'e' :: _ | 'E' :: _ =>
-      -- consume [. digits] and/or [e[+-]digits]; at least one digit required after each marker
-      let frac : P → Option P
-        | '.' :: r =>
-          let ds := r.takeWhile isDigitC
-          if ds.isEmpty then none else some (r.drop ds.length)
-        | r => some r
-      match frac r1 with
+    let r2 : Option P :=
+      match r1 with
+      | '.' :: r =>
+        let ds := r.takeWhile isDigitC
+        if ds.isEmpty then none else some (r.drop ds.length)
+      | _ => some r1
+    match r2 with
+    | none => none
+    | some r2v =>
+      let r3 : Option P :=
+        match r2v with
+        | e :: r =>
+          if e = 'e' || e = 'E' then
+            match r with
+            | sg :: r' =>
+              let r'' := if sg = '+' || sg = '-' then r' else sg :: r'
+              let ds := r''.takeWhile isDigitC
+              if ds.isEmpty then none else some (r''.drop ds.length)
+            | [] => none
+          else some r2v
+        | _ => some r2v
+      match r3 with
       | none => none
-      | some r2 =>
-        let expo : P → Option P
-          | e :: r =>
-            if e = 'e' || e = 'E' then
-              match r with
-              | s :: r' =>
-                let r'' := if s = '+' || s = '-' then r' else r
-                let ds := r''.takeWhile isDigitC
-                if ds.isEmpty then none else some (r''.drop ds.length)
-              | [] => none
-            else some r
-          | r => some r
-        match expo r2 with
-        | none => none
-        | some r3 => some (.fnum, r3)
-    | _ => some (.num (if neg then -intVal else intVal), r1)
+      | some r3v =>
+        if r3v == r1 then
+          some (.num (if neg then -intVal else intVal), r1)
+        else
+          some (.fnum, r3v)
 
 private partial def parseValue : P → Option (Json × P) := fun p =>
   match ws p with

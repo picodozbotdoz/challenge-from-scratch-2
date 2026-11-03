@@ -33,3 +33,9 @@
 2026-11-03T13:04:42Z NOTE  M5: bugs fixed: jv_number frame bug (tail-jmp+ret mismatch -> call + flag-based failure), missing closing brace in create literal, inverted like status, main.c flush-first on pipelined/partial reads (need_more)
 2026-11-03T13:04:42Z OK    M5: tools/test_local.sh -> passed=42 failed=0 (FULL SUITE); promoted gen/app_gen.s (gate=42)
 2026-11-03T13:04:42Z MILE M5 done
+2026-11-03T13:39:54Z BEGIN M6: differential harness + hardening
+2026-11-03T13:39:54Z NOTE  M6: tools/gen_corpus.py (1042 cases: JSON validity+mutations, unescape incl surrogates, b64, sha256, hmac incl >64B keys, parseid/parseexp) + tests/asm_corpus.c + spec exe specdump + tools/diff_corpus.sh
+2026-11-03T13:39:54Z NOTE  M6: corpus-driven fixes: spec Json.parseNum rewritten flat (nested-let bug rejected floats in containers), spec rejects leading-zero numbers (RFC), asm json_valid gates on strict UTF-8, asm parseexp whole-string strict, unescape lone-low-surrogate range
+2026-11-03T13:39:54Z NOTE  M6: hardening: RLIMIT_NOFILE raise, SIGALRM idle sweep (default 8x10s=80s >= 65s rule), conn generation guard vs stale cqes, shutdown-before-close (io_uring read pins fd), interruptible uring_wait
+2026-11-03T13:39:54Z OK    M6: diff_corpus IDENTICAL (1042 cases); test_local 42/42 with sweep enabled; promoted
+2026-11-03T13:39:54Z MILE M6 done

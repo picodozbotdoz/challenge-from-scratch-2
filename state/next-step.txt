@@ -1,1 +1,1 @@
-cd submissions/lean-asm2-picodoz/spec && ../../../tools/lean_cap.sh lake exe speccheck   # M6 regression gate
+( cd submissions/lean-asm2-picodoz/spec && ../../../tools/lean_cap.sh lake exe speccheck ) && ./tools/diff_corpus.sh   # M7 gate

@@ -1602,6 +1602,8 @@ parseexp_asm:
     inc rcx
     jmp .Lpe_sskip
 .Lpe_end:
+    cmp rcx, rsi
+    jne .Lpe_bad
     test r8d, r8d
     jz .Lpe_bad
     test edx, edx
@@ -1884,6 +1886,21 @@ json_valid_asm:
     lea r14, [rdi+rsi]
     mov QWORD PTR [rip+jv_ok], 1
     xor r15d, r15d
+    push rdi
+    push rsi
+    push rdi
+    push rsi
+    sub rsp, 8
+    call utf8ok_asm
+    add rsp, 8
+    pop rsi
+    pop rdi
+    pop rsi
+    pop rdi
+    test al, al
+    jz jv_ret0
+    mov r13, rdi
+    lea r14, [rdi+rsi]
     call jv_value
 jv_ws_i_t1:
     cmp r13, r14
@@ -2511,7 +2528,7 @@ ju_uni_loop:
     cmp edx, 0xD800
     jb ju_uni_emit
     cmp edx, 0xDBFF
-    ja ju_bad
+    ja ju_chk_low
     sub edx, 0xD800
     shl edx, 10
     mov ebx, edx
@@ -2546,6 +2563,9 @@ ju_uni_loop2:
     add r12d, 0x10000
     mov edx, r12d
     jmp ju_uni_emit
+ju_chk_low:
+    cmp edx, 0xDFFF
+    jbe ju_bad
 ju_uni_emit:
     cmp edx, 0x80
     jb ju_u1

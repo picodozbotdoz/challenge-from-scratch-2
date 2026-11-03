@@ -16,3 +16,7 @@ lean_exe «speccheck» {
 lean_exe «derive» {
   root := `Feed.Derive
 }
+
+lean_exe «specdump» {
+  root := `Feed.SpecDump
+}
