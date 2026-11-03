@@ -39,3 +39,7 @@
 2026-11-03T13:39:54Z NOTE  M6: hardening: RLIMIT_NOFILE raise, SIGALRM idle sweep (default 8x10s=80s >= 65s rule), conn generation guard vs stale cqes, shutdown-before-close (io_uring read pins fd), interruptible uring_wait
 2026-11-03T13:39:54Z OK    M6: diff_corpus IDENTICAL (1042 cases); test_local 42/42 with sweep enabled; promoted
 2026-11-03T13:39:54Z MILE M6 done
+2026-11-03T13:41:13Z BEGIN M7: packaging
+2026-11-03T13:41:13Z NOTE  M7: install.sh (build-essential + libsqlite3-dev only; NO Lean at deploy), build.sh, start.sh (foreground, env-only), README (stack, proved-vs-tested honesty line, direct mode, edge decisions), .gitignore; core dump artifact removed
+2026-11-03T13:41:13Z OK    M7: PORT=3457 bash ../repo/twelve-dollar-server-challenge/test/run.sh <abs submission dir> -> exit 0, 42/42
+2026-11-03T13:41:13Z MILE M7 done
