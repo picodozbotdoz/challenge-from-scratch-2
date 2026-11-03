@@ -155,11 +155,12 @@ int main(void) {
             c->rbuf[c->rlen] = 0;
             /* parse+serve as many pipelined requests as are complete */
             int served = 0;
+            int need_more = 0;
             while (!c->closing) {
               struct AppReq req;
               size_t consumed = 0;
               int prc = http_parse_request(c, &req, &consumed);
-              if (prc == 0) break;
+              if (prc == 0) { need_more = 1; break; }
               if (prc < 0) {
                 const char *bad = "{\"error\":\"not found\"}";
                 c->keep_alive = 0;
@@ -176,6 +177,8 @@ int main(void) {
               if (++served >= 16) break;   /* fairness */
             }
             if (c->closing) { conn_close(c); }
+            else if (served > 0) { arm_write(c, slot); }   /* flush framed response */
+            else if (need_more) { arm_read(c, slot); }     /* request still partial */
             else arm_write(c, slot);
           }
         } else if (op == OP_WRITE) {

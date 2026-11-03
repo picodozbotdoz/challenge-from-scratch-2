@@ -1,4 +1,4 @@
-# gen/app_gen.s — EMITTED by spec/EmitAsm.lean + spec/EmitAuth.lean (lake exe derive). Do not hand-edit.
+# gen/app_gen.s — EMITTED by spec/EmitAsm.lean + EmitAuth.lean + EmitBody.lean (lake exe derive). Do not hand-edit.
 # Layout equates: owned here, pinned by runtime/abi.h _Static_asserts.
 .intel_syntax noprefix
 .set APPREQ_METHOD, 0
@@ -368,9 +368,7 @@ app_request:
     call .Lauth_check
     cmp eax, 0
     jne .Lac_err
-    mov rdi, r12
-    call x_fail
-    jmp .Ldone
+    jmp .Lcreate_body
 .Lpost_like:
     call .Lauth_check
     cmp eax, 0
@@ -380,9 +378,7 @@ app_request:
     call parseid_asm
     test edx, edx
     jz .Linvalidid
-    mov rdi, r12
-    call x_fail
-    jmp .Ldone
+    jmp .Llike_body
 .Lac_err:
     cmp eax, 1
     jne .Lac_err2
@@ -408,10 +404,237 @@ app_request:
     call x_out_str
     mov eax, 401
     jmp .Ldone
+.Lcreate_body:
+    sub rsp, 0x5040
+    mov rdi, [rbx+APPREQ_BODY]
+    movsx rsi, DWORD PTR [rbx+APPREQ_BODY_LEN]
+    test rsi, rsi
+    jz .Lcreate_malformed
+    cmp rsi, 16000
+    ja .Lcreate_malformed
+    call json_valid_asm
+    test al, al
+    jz .Lcreate_malformed
+    mov rdi, [rbx+APPREQ_BODY]
+    movsx rsi, DWORD PTR [rbx+APPREQ_BODY_LEN]
+    lea rdx, [rip+.Lstr19]
+    mov ecx, 4
+    call jsonfind_asm
+    test rax, rax
+    jz .Lcreate_required
+    cmp r8, 2
+    jb .Lcreate_required
+    cmp BYTE PTR [rax], 34
+    jne .Lcreate_required
+    cmp BYTE PTR [rax+r8-1], 34
+    jne .Lcreate_required
+    lea rdx, [rax+1]
+    mov rcx, r8
+    sub rcx, 2
+    lea rdi, [rsp]
+    mov esi, 20480
+    call json_unescape_asm
+    cmp rax, 0
+    jl .Lcreate_500x
+    mov r14, rax
+    lea rdi, [rsp]
+    mov rsi, r14
+    call trim_asm
+    mov [rsp+0x5020], rax
+    mov [rsp+0x5028], r8
+    test r8, r8
+    jz .Lcreate_required
+    mov rdi, rax
+    mov rsi, r8
+    call cplen_asm
+    cmp rax, 500
+    ja .Lcreate_toolong
+    lea rdi, [rip+.Lstr20]
+    mov esi, 72
+    call x_db_prepare
+    test rax, rax
+    jz .Lcreate_500x
+    mov r13, rax
+    mov rdi, r13
+    mov esi, 1
+    mov rdx, [rip+g_uid]
+    call x_db_bind_int
+    mov rdi, r13
+    mov esi, 2
+    mov rdx, [rsp+0x5020]
+    mov rcx, [rsp+0x5028]
+    call x_db_bind_text
+    mov rdi, r13
+    call x_db_step
+    cmp eax, 1
+    jne .Lcreate_500x
+    mov rdi, r13
+    xor esi, esi
+    call x_db_column_int
+    mov r14, rax
+    mov rdi, r13
+    mov esi, 1
+    call x_db_column_text
+    mov r15, rax
+    mov rdi, r13
+    mov esi, 1
+    call x_db_column_bytes
+    mov [rsp+0x5030], rax
+    mov rdi, r12
+    lea rsi, [rip+.Lstr21]
+    mov edx, 14
+    call x_out_str
+    mov rdi, r12
+    mov rsi, r14
+    call x_out_int
+    mov rdi, r12
+    lea rsi, [rip+.Lstr22]
+    mov edx, 9
+    call x_out_str
+    mov rsi, [rsp+0x5020]
+    mov rdx, [rsp+0x5028]
+    mov rdi, r12
+    call x_out_json_escaped_str
+    mov rdi, r12
+    lea rsi, [rip+.Lstr23]
+    mov edx, 16
+    call x_out_str
+    mov rsi, r15
+    mov rdx, [rsp+0x5030]
+    mov rdi, r12
+    call x_out_str
+    mov rdi, r12
+    lea rsi, [rip+.Lstr24]
+    mov edx, 12
+    call x_out_str
+    mov rsi, [rip+g_uname_ptr]
+    mov rdx, [rip+g_uname_len]
+    mov rdi, r12
+    call x_out_str
+    mov rdi, r12
+    lea rsi, [rip+.Lstr25]
+    mov edx, 18
+    call x_out_str
+    mov rdi, r13
+    call x_db_reset
+    mov eax, 201
+    add rsp, 0x5040
+    jmp .Ldone
+.Lcreate_malformed:
+    add rsp, 0x5040
+    mov rdi, r12
+    lea rsi, [rip+.Lstr26]
+    mov edx, 31
+    call x_out_str
+    mov eax, 400
+    jmp .Ldone
+.Lcreate_required:
+    add rsp, 0x5040
+    mov rdi, r12
+    lea rsi, [rip+.Lstr27]
+    mov edx, 28
+    call x_out_str
+    mov eax, 400
+    jmp .Ldone
+.Lcreate_toolong:
+    add rsp, 0x5040
+    mov rdi, r12
+    lea rsi, [rip+.Lstr28]
+    mov edx, 47
+    call x_out_str
+    mov eax, 400
+    jmp .Ldone
+.Lcreate_500x:
+    add rsp, 0x5040
+    mov rdi, r12
+    call x_fail
+    jmp .Ldone
+.Llike_body:
+    mov r14, rax
+    lea rdi, [rip+.Lstr29]
+    mov esi, 32
+    call x_db_prepare
+    test rax, rax
+    jz .Lerr500
+    mov r13, rax
+    mov rdi, r13
+    mov esi, 1
+    mov rdx, r14
+    call x_db_bind_int
+    mov rdi, r13
+    call x_db_step
+    cmp eax, 1
+    jne .Llike_notfound
+    mov rdi, r13
+    call x_db_reset
+    lea rdi, [rip+.Lstr30]
+    mov esi, 92
+    call x_db_prepare
+    test rax, rax
+    jz .Lerr500
+    mov r13, rax
+    mov rdi, r13
+    mov esi, 1
+    mov rdx, [rip+g_uid]
+    call x_db_bind_int
+    mov rdi, r13
+    mov esi, 2
+    mov rdx, r14
+    call x_db_bind_int
+    mov rdi, r13
+    call x_db_step
+    mov rdi, r13
+    call x_db_reset
+    call x_db_changes
+    xor r15d, r15d
+    cmp rax, 1
+    setne r15b
+    mov rdi, r12
+    lea rsi, [rip+.Lstr31]
+    mov edx, 30
+    call x_out_str
+    test r15d, r15d
+    jz .Llike_first
+    mov rdi, r12
+    lea rsi, [rip+.Lstr32]
+    mov edx, 4
+    call x_out_str
+    jmp .Llike_postid
+.Llike_first:
+    mov rdi, r12
+    lea rsi, [rip+.Lstr33]
+    mov edx, 5
+    call x_out_str
+.Llike_postid:
+    mov rdi, r12
+    lea rsi, [rip+.Lstr34]
+    mov edx, 11
+    call x_out_str
+    mov rdi, r12
+    mov rsi, r14
+    call x_out_int
+    mov rdi, r12
+    mov esi, 125
+    call x_out_byte
+    mov eax, 201
+    test r15d, r15d
+    jz .Llike_st
+    mov eax, 200
+.Llike_st:
+    jmp .Ldone
+.Llike_notfound:
+    mov rdi, r13
+    call x_db_reset
+    mov rdi, r12
+    lea rsi, [rip+.Lstr15]
+    mov edx, 26
+    call x_out_str
+    mov eax, 404
+    jmp .Ldone
 .Lemit_post:
     sub rsp, 8
     mov rdi, r12
-    lea rsi, [rip+.Lstr19]
+    lea rsi, [rip+.Lstr35]
     mov edx, 6
     call x_out_str
     mov rdi, r13
@@ -421,7 +644,7 @@ app_request:
     mov rsi, rax
     call x_out_int
     mov rdi, r12
-    lea rsi, [rip+.Lstr20]
+    lea rsi, [rip+.Lstr22]
     mov edx, 9
     call x_out_str
     mov rdi, r13
@@ -436,7 +659,7 @@ app_request:
     mov rdi, r12
     call x_out_json_escaped_str
     mov rdi, r12
-    lea rsi, [rip+.Lstr21]
+    lea rsi, [rip+.Lstr23]
     mov edx, 16
     call x_out_str
     mov rdi, r13
@@ -451,7 +674,7 @@ app_request:
     mov rdi, r12
     call x_out_json_escaped_str
     mov rdi, r12
-    lea rsi, [rip+.Lstr22]
+    lea rsi, [rip+.Lstr24]
     mov edx, 12
     call x_out_str
     mov rdi, r13
@@ -466,7 +689,7 @@ app_request:
     mov rdi, r12
     call x_out_json_escaped_str
     mov rdi, r12
-    lea rsi, [rip+.Lstr23]
+    lea rsi, [rip+.Lstr36]
     mov edx, 15
     call x_out_str
     mov rdi, r13
@@ -1402,7 +1625,7 @@ parseexp_asm:
     jl .Lac_missing
     mov rdi, [rbx+APPREQ_AUTH]
     movsx rsi, DWORD PTR [rbx+APPREQ_AUTH_LEN]
-    lea rdx, [rip+.Lstr24]
+    lea rdx, [rip+.Lstr37]
     mov ecx, 7
     call .Lstreqpfx
     test al, al
@@ -1489,14 +1712,14 @@ parseexp_asm:
     pop rsi
     test al, al
     jz .Lac_invalid
-    lea rdx, [rip+.Lstr25]
+    lea rdx, [rip+.Lstr38]
     mov ecx, 3
     call jsonfind_asm
     test rax, rax
     jz .Lac_invalid
     mov rdi, rax
     mov rsi, r8
-    lea rdx, [rip+.Lstr26]
+    lea rdx, [rip+.Lstr39]
     mov ecx, 7
     call .Lstreq
     test al, al
@@ -1554,7 +1777,7 @@ parseexp_asm:
 .Lac_sigok:
     lea rdi, [rsp+0x200]
     mov rsi, [rsp+0x8E0]
-    lea rdx, [rip+.Lstr27]
+    lea rdx, [rip+.Lstr40]
     mov ecx, 3
     call jsonfind_asm
     test rax, rax
@@ -1574,7 +1797,7 @@ parseexp_asm:
     jle .Lac_invalid
     lea rdi, [rsp+0x200]
     mov rsi, [rsp+0x8E0]
-    lea rdx, [rip+.Lstr28]
+    lea rdx, [rip+.Lstr41]
     mov ecx, 3
     call jsonfind_asm
     test rax, rax
@@ -1600,7 +1823,7 @@ parseexp_asm:
     mov [rip+g_uid], rax
     lea rdi, [rsp+0x200]
     mov rsi, [rsp+0x8E0]
-    lea rdx, [rip+.Lstr29]
+    lea rdx, [rip+.Lstr42]
     mov ecx, 8
     call jsonfind_asm
     test rax, rax
@@ -1652,6 +1875,836 @@ parseexp_c_asm:
     pop rcx
     mov [rcx], edx
     ret
+.globl json_valid_asm
+json_valid_asm:
+    push r13
+    push r14
+    push r15
+    mov r13, rdi
+    lea r14, [rdi+rsi]
+    mov QWORD PTR [rip+jv_ok], 1
+    xor r15d, r15d
+    call jv_value
+jv_ws_i_t1:
+    cmp r13, r14
+    jae jv_ws_d_t1
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t1
+    cmp al, 9
+    je jv_ws_a_t1
+    cmp al, 10
+    je jv_ws_a_t1
+    cmp al, 13
+    jne jv_ws_d_t1
+jv_ws_a_t1:
+    inc r13
+    jmp jv_ws_i_t1
+jv_ws_d_t1:
+    mov rax, [rip+jv_ok]
+    test rax, rax
+    jz jv_ret0
+    cmp r13, r14
+    jne jv_ret0
+    mov al, 1
+    jmp jv_out
+jv_ret0:
+    xor eax, eax
+jv_out:
+    pop r15
+    pop r14
+    pop r13
+    ret
+jv_hexval:
+    cmp al, 48
+    jb jv_hexval_no
+    cmp al, 57
+    ja jv_hexval_alpha
+    sub al, 48
+    ret
+jv_hexval_alpha:
+    or al, 32
+    cmp al, 97
+    jb jv_hexval_no
+    cmp al, 102
+    ja jv_hexval_no
+    sub al, 87
+    ret
+jv_hexval_no:
+    mov al, 255
+    ret
+jv_parse_u4:
+    lea rax, [r13+4]
+    cmp rax, r14
+    ja jv_parse_u4_bad
+    xor edx, edx
+    xor ecx, ecx
+jv_parse_u4_loop:
+    movzx eax, BYTE PTR [r13+1+rcx]
+    call jv_hexval
+    cmp al, 255
+    je jv_parse_u4_bad
+    shl edx, 4
+    or edx, eax
+    inc ecx
+    cmp ecx, 4
+    jb jv_parse_u4_loop
+    ret
+jv_parse_u4_bad:
+    mov QWORD PTR [rip+jv_ok], 0
+    ret
+jv_string:
+    inc r13
+jv_str_loop:
+    cmp r13, r14
+    jae jv_str_bad
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    jb jv_str_bad
+    cmp al, 34
+    je jv_str_end
+    cmp al, 92
+    je jv_str_esc
+    inc r13
+    jmp jv_str_loop
+jv_str_end:
+    inc r13
+    ret
+jv_str_esc:
+    inc r13
+    cmp r13, r14
+    jae jv_str_bad
+    movzx eax, BYTE PTR [r13]
+    cmp al, 34
+    je jv_str_esc_ok
+    cmp al, 92
+    je jv_str_esc_ok
+    cmp al, 47
+    je jv_str_esc_ok
+    cmp al, 98
+    je jv_str_esc_ok
+    cmp al, 102
+    je jv_str_esc_ok
+    cmp al, 110
+    je jv_str_esc_ok
+    cmp al, 114
+    je jv_str_esc_ok
+    cmp al, 116
+    je jv_str_esc_ok
+    cmp al, 117
+    je jv_str_esc_u
+    mov QWORD PTR [rip+jv_ok], 0
+    jmp jv_str_bad
+jv_str_esc_ok:
+    inc r13
+    jmp jv_str_loop
+jv_str_esc_u:
+    call jv_parse_u4
+    cmp QWORD PTR [rip+jv_ok], 0
+    je jv_str_bad
+    cmp edx, 0xD800
+    jb jv_str_u_done
+    cmp edx, 0xDBFF
+    ja jv_str_bad
+    add r13, 5
+    cmp r13, r14
+    jae jv_str_bad
+    cmp BYTE PTR [r13], 92
+    jne jv_str_bad
+    inc r13
+    cmp r13, r14
+    jae jv_str_bad
+    cmp BYTE PTR [r13], 117
+    jne jv_str_bad
+    call jv_parse_u4
+    cmp QWORD PTR [rip+jv_ok], 0
+    je jv_str_bad
+    cmp edx, 0xDC00
+    jb jv_str_bad
+    cmp edx, 0xDFFF
+    ja jv_str_bad
+    add r13, 5
+    jmp jv_str_loop
+jv_str_u_done:
+    add r13, 5
+    jmp jv_str_loop
+jv_str_bad:
+    mov QWORD PTR [rip+jv_ok], 0
+    ret
+jv_number:
+    cmp BYTE PTR [r13], 45
+    jne jv_num_int
+    inc r13
+jv_num_int:
+    cmp r13, r14
+    jae jv_num_bad
+    movzx eax, BYTE PTR [r13]
+    cmp al, 48
+    jb jv_num_bad
+    cmp al, 57
+    ja jv_num_bad
+    cmp al, 48
+    jne jv_num_digits
+    inc r13
+    cmp r13, r14
+    jae jv_num_frac
+    movzx eax, BYTE PTR [r13]
+    cmp al, 48
+    jb jv_num_frac
+    cmp al, 57
+    jbe jv_num_bad
+    jmp jv_num_frac
+jv_num_digits:
+jv_num_digits_loop:
+    cmp r13, r14
+    jae jv_num_frac
+    movzx eax, BYTE PTR [r13]
+    cmp al, 48
+    jb jv_num_frac
+    cmp al, 57
+    ja jv_num_frac
+    inc r13
+    jmp jv_num_digits_loop
+jv_num_frac:
+    cmp r13, r14
+    jae jv_num_ret
+    cmp BYTE PTR [r13], 46
+    jne jv_num_exp
+    inc r13
+    cmp r13, r14
+    jae jv_num_bad
+    movzx eax, BYTE PTR [r13]
+    cmp al, 48
+    jb jv_num_bad
+    cmp al, 57
+    ja jv_num_bad
+jv_num_frac_loop:
+    cmp r13, r14
+    jae jv_num_exp
+    movzx eax, BYTE PTR [r13]
+    cmp al, 48
+    jb jv_num_exp
+    cmp al, 57
+    ja jv_num_exp
+    inc r13
+    jmp jv_num_frac_loop
+jv_num_exp:
+    cmp r13, r14
+    jae jv_num_ret
+    movzx eax, BYTE PTR [r13]
+    cmp al, 101
+    je jv_num_exp_go
+    cmp al, 69
+    jne jv_num_ret
+jv_num_exp_go:
+    inc r13
+    cmp r13, r14
+    jae jv_num_bad
+    movzx eax, BYTE PTR [r13]
+    cmp al, 43
+    je jv_num_exp_sign
+    cmp al, 45
+    jne jv_num_exp_dig
+jv_num_exp_sign:
+    inc r13
+jv_num_exp_dig:
+    cmp r13, r14
+    jae jv_num_bad
+    movzx eax, BYTE PTR [r13]
+    cmp al, 48
+    jb jv_num_bad
+    cmp al, 57
+    ja jv_num_bad
+jv_num_exp_loop:
+    cmp r13, r14
+    jae jv_num_ret
+    movzx eax, BYTE PTR [r13]
+    cmp al, 48
+    jb jv_num_ret
+    cmp al, 57
+    ja jv_num_ret
+    inc r13
+    jmp jv_num_exp_loop
+jv_num_ret:
+    ret
+jv_num_bad:
+    mov QWORD PTR [rip+jv_ok], 0
+    ret
+jv_value:
+    push r15
+    cmp r15, 64
+    ja jv_bad
+jv_ws_i_t2:
+    cmp r13, r14
+    jae jv_ws_d_t2
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t2
+    cmp al, 9
+    je jv_ws_a_t2
+    cmp al, 10
+    je jv_ws_a_t2
+    cmp al, 13
+    jne jv_ws_d_t2
+jv_ws_a_t2:
+    inc r13
+    jmp jv_ws_i_t2
+jv_ws_d_t2:
+    cmp r13, r14
+    jae jv_bad
+    movzx eax, BYTE PTR [r13]
+    cmp al, 123
+    je jv_obj
+    cmp al, 91
+    je jv_arr
+    cmp al, 34
+    je jv_val_str
+    cmp al, 116
+    je jv_true
+    cmp al, 102
+    je jv_false
+    cmp al, 110
+    je jv_null
+    call jv_number
+    jmp jv_val_done
+jv_val_str:
+    call jv_string
+    cmp QWORD PTR [rip+jv_ok], 0
+    je jv_bad
+    jmp jv_val_done
+jv_true:
+    lea rax, [r13+3]
+    cmp rax, r14
+    ja jv_bad
+    cmp BYTE PTR [r13+1], 114
+    jne jv_bad
+    cmp BYTE PTR [r13+2], 117
+    jne jv_bad
+    cmp BYTE PTR [r13+3], 101
+    jne jv_bad
+    add r13, 4
+    jmp jv_val_done
+jv_false:
+    lea rax, [r13+4]
+    cmp rax, r14
+    ja jv_bad
+    cmp BYTE PTR [r13+1], 97
+    jne jv_bad
+    cmp BYTE PTR [r13+2], 108
+    jne jv_bad
+    cmp BYTE PTR [r13+3], 115
+    jne jv_bad
+    cmp BYTE PTR [r13+4], 101
+    jne jv_bad
+    add r13, 5
+    jmp jv_val_done
+jv_null:
+    lea rax, [r13+3]
+    cmp rax, r14
+    ja jv_bad
+    cmp BYTE PTR [r13+1], 117
+    jne jv_bad
+    cmp BYTE PTR [r13+2], 108
+    jne jv_bad
+    cmp BYTE PTR [r13+3], 108
+    jne jv_bad
+    add r13, 4
+    jmp jv_val_done
+jv_obj:
+    inc r13
+jv_ws_i_t3:
+    cmp r13, r14
+    jae jv_ws_d_t3
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t3
+    cmp al, 9
+    je jv_ws_a_t3
+    cmp al, 10
+    je jv_ws_a_t3
+    cmp al, 13
+    jne jv_ws_d_t3
+jv_ws_a_t3:
+    inc r13
+    jmp jv_ws_i_t3
+jv_ws_d_t3:
+    cmp r13, r14
+    jae jv_bad
+    cmp BYTE PTR [r13], 125
+    je jv_obj_empty
+jv_obj_pair:
+    cmp BYTE PTR [r13], 34
+    jne jv_bad
+    call jv_string
+    cmp QWORD PTR [rip+jv_ok], 0
+    je jv_bad
+jv_ws_i_t4:
+    cmp r13, r14
+    jae jv_ws_d_t4
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t4
+    cmp al, 9
+    je jv_ws_a_t4
+    cmp al, 10
+    je jv_ws_a_t4
+    cmp al, 13
+    jne jv_ws_d_t4
+jv_ws_a_t4:
+    inc r13
+    jmp jv_ws_i_t4
+jv_ws_d_t4:
+    cmp r13, r14
+    jae jv_bad
+    cmp BYTE PTR [r13], 58
+    jne jv_bad
+    inc r13
+    inc r15
+    call jv_value
+    dec r15
+    cmp QWORD PTR [rip+jv_ok], 0
+    je jv_bad
+jv_ws_i_t5:
+    cmp r13, r14
+    jae jv_ws_d_t5
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t5
+    cmp al, 9
+    je jv_ws_a_t5
+    cmp al, 10
+    je jv_ws_a_t5
+    cmp al, 13
+    jne jv_ws_d_t5
+jv_ws_a_t5:
+    inc r13
+    jmp jv_ws_i_t5
+jv_ws_d_t5:
+    cmp r13, r14
+    jae jv_bad
+    cmp BYTE PTR [r13], 44
+    je jv_obj_comma
+    cmp BYTE PTR [r13], 125
+    je jv_obj_close
+    mov QWORD PTR [rip+jv_ok], 0
+    jmp jv_bad
+jv_obj_comma:
+    inc r13
+jv_ws_i_t6:
+    cmp r13, r14
+    jae jv_ws_d_t6
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t6
+    cmp al, 9
+    je jv_ws_a_t6
+    cmp al, 10
+    je jv_ws_a_t6
+    cmp al, 13
+    jne jv_ws_d_t6
+jv_ws_a_t6:
+    inc r13
+    jmp jv_ws_i_t6
+jv_ws_d_t6:
+    cmp r13, r14
+    jae jv_bad
+    jmp jv_obj_pair
+jv_obj_close:
+    inc r13
+    jmp jv_val_done
+jv_obj_empty:
+    inc r13
+    jmp jv_val_done
+jv_arr:
+    inc r13
+jv_ws_i_t7:
+    cmp r13, r14
+    jae jv_ws_d_t7
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t7
+    cmp al, 9
+    je jv_ws_a_t7
+    cmp al, 10
+    je jv_ws_a_t7
+    cmp al, 13
+    jne jv_ws_d_t7
+jv_ws_a_t7:
+    inc r13
+    jmp jv_ws_i_t7
+jv_ws_d_t7:
+    cmp r13, r14
+    jae jv_bad
+    cmp BYTE PTR [r13], 93
+    je jv_arr_empty
+jv_arr_item:
+    inc r15
+    call jv_value
+    dec r15
+    cmp QWORD PTR [rip+jv_ok], 0
+    je jv_bad
+jv_ws_i_t8:
+    cmp r13, r14
+    jae jv_ws_d_t8
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t8
+    cmp al, 9
+    je jv_ws_a_t8
+    cmp al, 10
+    je jv_ws_a_t8
+    cmp al, 13
+    jne jv_ws_d_t8
+jv_ws_a_t8:
+    inc r13
+    jmp jv_ws_i_t8
+jv_ws_d_t8:
+    cmp r13, r14
+    jae jv_bad
+    cmp BYTE PTR [r13], 44
+    je jv_arr_comma
+    cmp BYTE PTR [r13], 93
+    je jv_arr_close
+    mov QWORD PTR [rip+jv_ok], 0
+    jmp jv_bad
+jv_arr_comma:
+    inc r13
+jv_ws_i_t9:
+    cmp r13, r14
+    jae jv_ws_d_t9
+    movzx eax, BYTE PTR [r13]
+    cmp al, 32
+    je jv_ws_a_t9
+    cmp al, 9
+    je jv_ws_a_t9
+    cmp al, 10
+    je jv_ws_a_t9
+    cmp al, 13
+    jne jv_ws_d_t9
+jv_ws_a_t9:
+    inc r13
+    jmp jv_ws_i_t9
+jv_ws_d_t9:
+    cmp r13, r14
+    jae jv_bad
+    cmp BYTE PTR [r13], 93
+    je jv_bad
+    jmp jv_arr_item
+jv_arr_close:
+    inc r13
+    jmp jv_val_done
+jv_arr_empty:
+    inc r13
+jv_val_done:
+    pop r15
+    ret
+jv_bad:
+    mov QWORD PTR [rip+jv_ok], 0
+jv_exit:
+    pop r15
+    ret
+.globl json_unescape_asm
+json_unescape_asm:
+    push rbx
+    push r12
+    mov r8, rdi
+    lea r9, [rdi+rsi]
+    mov r10, rdx
+    lea r11, [rdx+rcx]
+ju_loop:
+    cmp r10, r11
+    jae ju_done
+    movzx eax, BYTE PTR [r10]
+    cmp al, 92
+    je ju_esc
+    cmp r8, r9
+    jae ju_full
+    mov [r8], al
+    inc r8
+    inc r10
+    jmp ju_loop
+ju_esc:
+    inc r10
+    cmp r10, r11
+    jae ju_bad
+    movzx eax, BYTE PTR [r10]
+    cmp al, 34
+    je ju_lit
+    cmp al, 92
+    je ju_lit
+    cmp al, 47
+    je ju_lit
+    cmp al, 98
+    je ju_bs
+    cmp al, 102
+    je ju_ff
+    cmp al, 110
+    je ju_nl
+    cmp al, 114
+    je ju_cr
+    cmp al, 116
+    je ju_tab
+    cmp al, 117
+    je ju_uni
+    jmp ju_bad
+ju_lit:
+    cmp r8, r9
+    jae ju_full
+    mov [r8], al
+    inc r8
+    inc r10
+    jmp ju_loop
+ju_bs:
+    inc r10
+    jmp ju_put8
+ju_put8:
+    cmp r8, r9
+    jae ju_full
+    mov BYTE PTR [r8], 8
+    inc r8
+    jmp ju_loop
+ju_ff:
+    inc r10
+    cmp r8, r9
+    jae ju_full
+    mov BYTE PTR [r8], 12
+    inc r8
+    jmp ju_loop
+ju_nl:
+    inc r10
+    cmp r8, r9
+    jae ju_full
+    mov BYTE PTR [r8], 10
+    inc r8
+    jmp ju_loop
+ju_cr:
+    inc r10
+    cmp r8, r9
+    jae ju_full
+    mov BYTE PTR [r8], 13
+    inc r8
+    jmp ju_loop
+ju_tab:
+    inc r10
+    cmp r8, r9
+    jae ju_full
+    mov BYTE PTR [r8], 9
+    inc r8
+    jmp ju_loop
+ju_uni:
+    lea rax, [r10+4]
+    cmp rax, r11
+    ja ju_bad
+    xor edx, edx
+    mov ecx, 4
+ju_uni_loop:
+    movzx eax, BYTE PTR [r10+1]
+    call ju_hexval
+    cmp al, 255
+    je ju_bad
+    shl edx, 4
+    or edx, eax
+    inc r10
+    dec ecx
+    jnz ju_uni_loop
+    inc r10
+    cmp edx, 0xD800
+    jb ju_uni_emit
+    cmp edx, 0xDBFF
+    ja ju_bad
+    sub edx, 0xD800
+    shl edx, 10
+    mov ebx, edx
+ju_uni_second:
+    lea rax, [r10+6]
+    cmp rax, r11
+    ja ju_bad
+    cmp BYTE PTR [r10], 92
+    jne ju_bad
+    cmp BYTE PTR [r10+1], 117
+    jne ju_bad
+    mov ecx, 4
+    xor edx, edx
+ju_uni_loop2:
+    movzx eax, BYTE PTR [r10+2]
+    call ju_hexval
+    cmp al, 255
+    je ju_bad
+    shl edx, 4
+    or edx, eax
+    inc r10
+    dec ecx
+    jnz ju_uni_loop2
+    add r10, 2
+    cmp edx, 0xDC00
+    jb ju_bad
+    cmp edx, 0xDFFF
+    ja ju_bad
+    sub edx, 0xDC00
+    mov r12d, edx
+    or r12d, ebx
+    add r12d, 0x10000
+    mov edx, r12d
+    jmp ju_uni_emit
+ju_uni_emit:
+    cmp edx, 0x80
+    jb ju_u1
+    cmp edx, 0x800
+    jb ju_u2
+    cmp edx, 0x10000
+    jb ju_u3
+    lea rax, [r8+4]
+    cmp rax, r9
+    ja ju_full
+    mov eax, edx
+    shr eax, 18
+    or eax, 0xF0
+    mov [r8], al
+    mov eax, edx
+    shr eax, 12
+    and eax, 63
+    or eax, 0x80
+    mov [r8+1], al
+    mov eax, edx
+    shr eax, 6
+    and eax, 63
+    or eax, 0x80
+    mov [r8+2], al
+    mov eax, edx
+    and eax, 63
+    or eax, 0x80
+    mov [r8+3], al
+    add r8, 4
+    jmp ju_loop
+ju_u3:
+    lea rax, [r8+3]
+    cmp rax, r9
+    ja ju_full
+    mov eax, edx
+    shr eax, 12
+    or eax, 0xE0
+    mov [r8], al
+    mov eax, edx
+    shr eax, 6
+    and eax, 63
+    or eax, 0x80
+    mov [r8+1], al
+    mov eax, edx
+    and eax, 63
+    or eax, 0x80
+    mov [r8+2], al
+    add r8, 3
+    jmp ju_loop
+ju_u2:
+    lea rax, [r8+2]
+    cmp rax, r9
+    ja ju_full
+    mov eax, edx
+    shr eax, 6
+    or eax, 0xC0
+    mov [r8], al
+    mov eax, edx
+    and eax, 63
+    or eax, 0x80
+    mov [r8+1], al
+    add r8, 2
+    jmp ju_loop
+ju_u1:
+    cmp r8, r9
+    jae ju_full
+    mov [r8], dl
+    inc r8
+    jmp ju_loop
+ju_done:
+    mov rax, r8
+    sub rax, rdi
+    pop r12
+    pop rbx
+    ret
+ju_bad:
+    mov rax, -1
+    pop r12
+    pop rbx
+    ret
+ju_full:
+    mov rax, -2
+    pop r12
+    pop rbx
+    ret
+ju_hexval:
+    cmp al, 48
+    jb ju_hexval_no
+    cmp al, 57
+    ja ju_hexval_alpha
+    sub al, 48
+    ret
+ju_hexval_alpha:
+    or al, 32
+    cmp al, 97
+    jb ju_hexval_no
+    cmp al, 102
+    ja ju_hexval_no
+    sub al, 87
+    ret
+ju_hexval_no:
+    mov al, 255
+    ret
+.globl trim_asm
+trim_asm:
+    mov rax, rdi
+    mov r8, rsi
+tr_lead:
+    test r8, r8
+    jz tr_done
+    movzx ecx, BYTE PTR [rax]
+    cmp cl, 32
+    je tr_adv
+    cmp cl, 9
+    je tr_adv
+    cmp cl, 10
+    je tr_adv
+    cmp cl, 13
+    je tr_adv
+    jmp tr_tail
+tr_adv:
+    inc rax
+    dec r8
+    jmp tr_lead
+tr_tail:
+    test r8, r8
+    jz tr_done
+    movzx ecx, BYTE PTR [rax+r8-1]
+    cmp cl, 32
+    je tr_tadv
+    cmp cl, 9
+    je tr_tadv
+    cmp cl, 10
+    je tr_tadv
+    cmp cl, 13
+    je tr_tadv
+    jmp tr_done
+tr_tadv:
+    dec r8
+    jmp tr_tail
+tr_done:
+    ret
+.globl cplen_asm
+cplen_asm:
+    xor eax, eax
+    xor rcx, rcx
+cp_loop:
+    cmp rcx, rsi
+    jae cp_done
+    movzx edx, BYTE PTR [rdi+rcx]
+    and edx, 0xC0
+    cmp edx, 0x80
+    je cp_cont
+    inc rax
+cp_cont:
+    inc rcx
+    jmp cp_loop
+cp_done:
+    ret
 .section .rodata
 .Lstr0:
     .byte 47, 104, 101, 97, 108, 116, 104
@@ -1692,26 +2745,52 @@ parseexp_c_asm:
 .Lstr18:
     .byte 123, 34, 101, 114, 114, 111, 114, 34, 58, 34, 105, 110, 118, 97, 108, 105, 100, 32, 116, 111, 107, 101, 110, 32, 112, 97, 121, 108, 111, 97, 100, 34, 125
 .Lstr19:
-    .byte 123, 34, 105, 100, 34, 58
+    .byte 98, 111, 100, 121
 .Lstr20:
-    .byte 44, 34, 98, 111, 100, 121, 34, 58, 34
+    .byte 73, 78, 83, 69, 82, 84, 32, 73, 78, 84, 79, 32, 112, 111, 115, 116, 115, 32, 40, 117, 115, 101, 114, 95, 105, 100, 44, 32, 98, 111, 100, 121, 41, 32, 86, 65, 76, 85, 69, 83, 32, 40, 63, 44, 32, 63, 41, 32, 82, 69, 84, 85, 82, 78, 73, 78, 71, 32, 105, 100, 44, 32, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116
 .Lstr21:
-    .byte 34, 44, 34, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 34, 58, 34
+    .byte 123, 34, 112, 111, 115, 116, 34, 58, 123, 34, 105, 100, 34, 58
 .Lstr22:
-    .byte 34, 44, 34, 97, 117, 116, 104, 111, 114, 34, 58, 34
+    .byte 44, 34, 98, 111, 100, 121, 34, 58, 34
 .Lstr23:
-    .byte 34, 44, 34, 108, 105, 107, 101, 95, 99, 111, 117, 110, 116, 34, 58
+    .byte 34, 44, 34, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 34, 58, 34
 .Lstr24:
-    .byte 66, 101, 97, 114, 101, 114, 32
+    .byte 34, 44, 34, 97, 117, 116, 104, 111, 114, 34, 58, 34
 .Lstr25:
-    .byte 97, 108, 103
+    .byte 34, 44, 34, 108, 105, 107, 101, 95, 99, 111, 117, 110, 116, 34, 58, 48, 125, 125
 .Lstr26:
-    .byte 34, 72, 83, 50, 53, 54, 34
+    .byte 123, 34, 101, 114, 114, 111, 114, 34, 58, 34, 109, 97, 108, 102, 111, 114, 109, 101, 100, 32, 74, 83, 79, 78, 32, 98, 111, 100, 121, 34, 125
 .Lstr27:
-    .byte 101, 120, 112
+    .byte 123, 34, 101, 114, 114, 111, 114, 34, 58, 34, 98, 111, 100, 121, 32, 105, 115, 32, 114, 101, 113, 117, 105, 114, 101, 100, 34, 125
 .Lstr28:
-    .byte 115, 117, 98
+    .byte 123, 34, 101, 114, 114, 111, 114, 34, 58, 34, 98, 111, 100, 121, 32, 109, 117, 115, 116, 32, 98, 101, 32, 97, 116, 32, 109, 111, 115, 116, 32, 53, 48, 48, 32, 99, 104, 97, 114, 97, 99, 116, 101, 114, 115, 34, 125
 .Lstr29:
+    .byte 83, 69, 76, 69, 67, 84, 32, 49, 32, 70, 82, 79, 77, 32, 112, 111, 115, 116, 115, 32, 87, 72, 69, 82, 69, 32, 105, 100, 32, 61, 32, 63
+.Lstr30:
+    .byte 73, 78, 83, 69, 82, 84, 32, 73, 78, 84, 79, 32, 108, 105, 107, 101, 115, 32, 40, 117, 115, 101, 114, 95, 105, 100, 44, 32, 112, 111, 115, 116, 95, 105, 100, 41, 32, 86, 65, 76, 85, 69, 83, 32, 40, 63, 44, 32, 63, 41, 32, 79, 78, 32, 67, 79, 78, 70, 76, 73, 67, 84, 32, 40, 117, 115, 101, 114, 95, 105, 100, 44, 32, 112, 111, 115, 116, 95, 105, 100, 41, 32, 68, 79, 32, 78, 79, 84, 72, 73, 78, 71
+.Lstr31:
+    .byte 123, 34, 108, 105, 107, 101, 100, 34, 58, 116, 114, 117, 101, 44, 34, 97, 108, 114, 101, 97, 100, 121, 95, 108, 105, 107, 101, 100, 34, 58
+.Lstr32:
+    .byte 116, 114, 117, 101
+.Lstr33:
+    .byte 102, 97, 108, 115, 101
+.Lstr34:
+    .byte 44, 34, 112, 111, 115, 116, 95, 105, 100, 34, 58
+.Lstr35:
+    .byte 123, 34, 105, 100, 34, 58
+.Lstr36:
+    .byte 34, 44, 34, 108, 105, 107, 101, 95, 99, 111, 117, 110, 116, 34, 58
+.Lstr37:
+    .byte 66, 101, 97, 114, 101, 114, 32
+.Lstr38:
+    .byte 97, 108, 103
+.Lstr39:
+    .byte 34, 72, 83, 50, 53, 54, 34
+.Lstr40:
+    .byte 101, 120, 112
+.Lstr41:
+    .byte 115, 117, 98
+.Lstr42:
     .byte 117, 115, 101, 114, 110, 97, 109, 101
 .section .bss
 .align 8
@@ -1720,5 +2799,6 @@ g_secret_len: .quad 0
 g_uid: .quad 0
 g_uname_ptr: .quad 0
 g_uname_len: .quad 0
+jv_ok: .quad 0
 
 .section .note.GNU-stack,"",@progbits

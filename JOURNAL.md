@@ -27,3 +27,9 @@
 2026-11-03T12:42:03Z NOTE  M4: bugs fixed en route: sigma0/1 shift-of-rotated (need 3rd copy), b64enc tail shifts, p64 pointer vs index, auth_len sign-extension (movsx), payload [rsp+0x200] mov->lea, .Lac_err3 fallthrough, ah-register encoding
 2026-11-03T12:42:03Z OK    M4: suite passed=25 (checks 14-22 auth all green); asm selftest PASS; promoted
 2026-11-03T12:42:03Z MILE M4 done
+2026-11-03T13:04:42Z BEGIN M5: body JSON + POST endpoints
+2026-11-03T13:04:42Z NOTE  M5: emitted json_valid_asm (strict recursive descent, surrogate pairing, no-leading-zero numbers, depth cap 64), json_unescape_asm (\uXXXX + surrogate pairs -> UTF-8), trim_asm, cplen_asm (code points = non-continuation bytes)
+2026-11-03T13:04:42Z NOTE  M5: create handler: validate -> extract body -> unescape -> trim -> 500cp cap -> INSERT..RETURNING -> exact 201 body; like handler: exists -> INSERT..ON CONFLICT DO NOTHING -> changes() -> 201/200
+2026-11-03T13:04:42Z NOTE  M5: bugs fixed: jv_number frame bug (tail-jmp+ret mismatch -> call + flag-based failure), missing closing brace in create literal, inverted like status, main.c flush-first on pipelined/partial reads (need_more)
+2026-11-03T13:04:42Z OK    M5: tools/test_local.sh -> passed=42 failed=0 (FULL SUITE); promoted gen/app_gen.s (gate=42)
+2026-11-03T13:04:42Z MILE M5 done
