@@ -1,0 +1,60 @@
+# opt-doc-6 — Final: ceiling found, loop stop assessment
+
+Date: 2026-11-04 · Branch: `dev/optimize2` · Parent: opt-doc-5
+
+## Headline results (this optimization loop, M10–M13)
+
+| metric | before (M9) | after | delta |
+|---|---|---|---|
+| worst observed max latency, 4000 VU official shape | **7.52 s** (freeze) | **74 ms** | ~100× |
+| worst p99, 4000 VU | 5.93 s (threshold-fail) | 20.1 ms | ~300× |
+| saturated throughput (hot.js 300 VU) | 14,705 req/s | 16,365 req/s | +11.2% |
+| max VUs held locally (60s ramp + 120s hold) | — | **12,000** (p99 5.8ms, 0 fail / 219,300 checks) | — |
+| 5-min official-shape hold | — | **10,000 VU**: p95=0.48ms p99=1.08ms max=59ms, 0 fail / 373,560 checks | — |
+| 42-check suite | 42/42 | 42/42 after every change | — |
+
+Fixes shipped (each with its doc, journal entry, and commit):
+- M10/opt-doc-2: checkpoint worker — fdatasync off the event loop (the score-capping fix).
+- M11/opt-doc-3: SQ-full deferred re-arm + ring 2048 (no conn drops / no accept exit).
+- M12/opt-doc-4: escape run-memcpy fast path, manual itoa, scratch OutBuf (+9.1%).
+- M13/opt-doc-5: SQLITE_OPEN_NOMUTEX, submit/wait enter merge, EINTR sync fix (+2%).
+
+## Final profile — what's left
+
+perf (hot load, post-all-fixes): `sqlite3VdbeExec` 7.3%, btree cursor walks
+~6.5% (`TableMoveto` 2.9% + `IndexMoveto` 1.8% + an unnamed hot block inside
+the cursor path), `sqlite3GetVarint` 1.8%, `x_out_json_escaped_str` 2.4%
+(scan loop itself now), kernel syscall/NMI floor ~8%+. `grow` and
+`pthread_mutex_lock` no longer appear.
+
+## Stop assessment — why the loop ends here
+
+1. **The score limiter is gone.** The bimodal multi-second freeze (the one
+   mechanism that could bust p99<1000ms at high VUs) is eliminated at the
+   source; worst residual stall is bounded at ~60-75ms, 13× under threshold.
+2. **CPU headroom is enormous.** At official-shape 10000 VU the server uses
+   ~5% of one core. Shaving the remaining sqlite-internal microseconds moves
+   a load the judge box will never saturate.
+3. **Remaining levers are structurally blocked or sub-noise:**
+   - Cursor-seek cost: index layout is owned by the fixed `schema.sql`
+     (challenge rule); query shapes are already index-driven.
+   - VDBE/varint: sqlite core, dynamic lib, off-limits without vendoring.
+   - Kernel/syscall floor: io_uring is already ~1 enter/req; SQPOLL would
+     burn the 1-vCPU judge box's single core on a polling thread.
+4. **Judge-box reality:** 1 vCPU shared with k6; our dev box (4 cores) gives
+   2-4× optimistic absolute numbers but the *mechanism* fixes (sync off-loop,
+   no drops, fewer syscalls) transfer directly. The ranking of risks there is
+   unchanged: checkpoint stalls were #1 — gone.
+
+Restart triggers (for a future loop): judge-box evidence of WAL growth under
+sustained writes (raise checkpoint cadence / add TRUNCATE at idle), p99
+climbing with connection count (MAXCONN 16384 headroom), or a challenge-rule
+change opening schema/index work.
+
+## Local-vs-official caveats
+
+- Dev box: 4 cores, local ext4, k6 co-resident — absolute numbers are
+  upper bounds; the official box is 1 vCPU.
+- `FEED_TICK_SECS` was at its default 10s for all tail runs (sweep under
+  test, and exonerated in opt-doc-1).
+- Raw artifacts in `work/prof/out-*` (gitignored); kit in `optimization/prof-kit/`.

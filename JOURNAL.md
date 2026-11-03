@@ -57,3 +57,6 @@
 2026-11-03T18:13:27Z OK    M12: 42/42; saturated 14705 -> 16048 req/s (+9.1%); tail unchanged
 2026-11-03T18:20:26Z BEGIN M13: fix#4 SQLITE_OPEN_NOMUTEX + submit/wait enter merge + EINTR sync_pending fix (db.c/uring.c)
 2026-11-03T18:20:26Z OK    M13: 42/42; saturated 16048 -> 16365 req/s; tail clean; latent double-submit-after-EINTR bug fixed
+2026-11-03T18:32:55Z BEGIN M14: final soak + stop assessment
+2026-11-03T18:32:55Z MILE M14 done
+2026-11-03T18:32:55Z OK    M14: 12000VU p99=5.8ms 0-fail; 10000VU 5min hold p95=0.48ms p99=1.08ms max=59ms 0/373560; final profile: sqlite core + kernel floor only; loop stopped — no meaningful improvement left (opt-doc-6)
