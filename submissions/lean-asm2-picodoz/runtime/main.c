@@ -280,10 +280,22 @@ int main(void) {
                 c->rlen = 0;
                 break;
               }
-              struct OutBuf out = {0};
+              /* scratch response buffer, reused across requests (event loop is
+               * single-threaded; content is fully rewritten per response). The
+               * grow ladder + malloc/free per request showed in perf (grow
+               * 1.5-4.8%, alloc). */
+              static char *g_scratch = NULL;
+              static uint64_t g_scratch_cap = 0;
+              if (!g_scratch) {
+                g_scratch_cap = 4096;
+                g_scratch = malloc(g_scratch_cap);
+                if (!g_scratch) { perror("scratch"); return 1; }
+              }
+              struct OutBuf out = { g_scratch, 0, g_scratch_cap };
               int status = app_request(&req, &out);
               http_frame_response(c, status, out.base ? out.base : "", out.len);
-              free(out.base);
+              g_scratch = out.base;      /* may have moved (realloc) */
+              g_scratch_cap = out.cap;
               c->rlen -= consumed;
               if (c->rlen > 0) memmove(c->rbuf, c->rbuf + consumed, c->rlen);
               if (++served >= 16) break;   /* fairness */

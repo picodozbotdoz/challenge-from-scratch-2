@@ -33,34 +33,55 @@ void x_out_mem(struct OutBuf *o, const char *p, int64_t len) {
 void x_out_str(struct OutBuf *o, const char *p, int64_t len) { x_out_mem(o, p, len); }
 
 void x_out_int(struct OutBuf *o, int64_t v) {
+  /* manual decimal: snprintf cost dominated this call on the hot path */
   char tmp[24];
-  int n = snprintf(tmp, sizeof tmp, "%lld", (long long)v);
-  x_out_mem(o, tmp, n);
+  int n = 0;
+  uint64_t u = (v < 0) ? (uint64_t)(-(v + 1)) + 1 : (uint64_t)v;
+  do { tmp[23 - n++] = (char)('0' + (u % 10)); u /= 10; } while (u);
+  if (v < 0) tmp[23 - n++] = '-';
+  x_out_mem(o, tmp + 24 - n, n);
 }
 
 /* JSON string escaping, exactly the spec serializer's contract:
    " \ and the C0 controls escaped (\b \f \n \r \t, else \u00xx); every other
-   byte — including UTF-8 payload — passes through verbatim. */
+   byte — including UTF-8 payload — passes through verbatim.
+   Fast path (M12): bulk-copy the run of plain bytes with one memcpy, only
+   dropping to the per-byte switch on ", \ or a control byte. */
 void x_out_json_escaped_str(struct OutBuf *o, const char *p, int64_t len) {
-  for (int64_t i = 0; i < len; i++) {
-    unsigned char c = (unsigned char)p[i];
-    switch (c) {
-    case '"':  x_out_mem(o, "\\\"", 2); break;
-    case '\\': x_out_mem(o, "\\\\", 2); break;
-    case '\n': x_out_mem(o, "\\n", 2); break;
-    case '\r': x_out_mem(o, "\\r", 2); break;
-    case '\t': x_out_mem(o, "\\t", 2); break;
-    case 0x08: x_out_mem(o, "\\b", 2); break;
-    case 0x0c: x_out_mem(o, "\\f", 2); break;
-    default:
-      if (c < 0x20) {
-        char tmp[6] = {'\\', 'u', '0', '0', "0123456789abcdef"[c >> 4],
-                       "0123456789abcdef"[c & 15]};
-        x_out_mem(o, tmp, 6);
-      } else {
-        x_out_byte(o, c);
-      }
+  int64_t i = 0;
+  while (i < len) {
+    int64_t j = i;
+    while (j < len) {
+      unsigned char c = (unsigned char)p[j];
+      if (c < 0x20 || c == '"' || c == '\\') break;
+      j++;
     }
+    if (j > i) {
+      grow(o, (uint64_t)(j - i));
+      memcpy(o->base + o->len, p + i, (size_t)(j - i));
+      o->len += (uint64_t)(j - i);
+      i = j;
+    }
+    if (i >= len) break;
+    unsigned char c = (unsigned char)p[i];
+    grow(o, 6);                              /* worst case: \u00xx */
+    char *d = o->base + o->len;
+    switch (c) {
+    case '"':  *d++ = '\\'; *d++ = '"';  o->len += 2; break;
+    case '\\': *d++ = '\\'; *d++ = '\\'; o->len += 2; break;
+    case '\n': *d++ = '\\'; *d++ = 'n';  o->len += 2; break;
+    case '\r': *d++ = '\\'; *d++ = 'r';  o->len += 2; break;
+    case '\t': *d++ = '\\'; *d++ = 't';  o->len += 2; break;
+    case 0x08: *d++ = '\\'; *d++ = 'b';  o->len += 2; break;
+    case 0x0c: *d++ = '\\'; *d++ = 'f';  o->len += 2; break;
+    default:   /* c < 0x20 */
+      *d++ = '\\'; *d++ = 'u'; *d++ = '0'; *d++ = '0';
+      *d++ = "0123456789abcdef"[c >> 4];
+      *d++ = "0123456789abcdef"[c & 15];
+      o->len += 6;
+      break;
+    }
+    i++;
   }
 }
 

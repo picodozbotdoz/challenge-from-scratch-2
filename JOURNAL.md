@@ -53,3 +53,5 @@
 2026-11-03T17:54:12Z OK    M10: 42/42; tail 4000VU max 455ms/7.5s -> 61.8/57.7ms; 8000VU p95=0.54ms p99=1.23ms max=69ms; WAL bounded 4.18MB
 2026-11-03T18:05:57Z BEGIN M11: fix#2 SQ-full deferred re-arm queue + ring 2048 (main.c/http.h)
 2026-11-03T18:05:57Z OK    M11: 42/42; 4000VU p95=0.61ms p99=6.0ms max=59ms; no-drop/no-exit arm path, submit-before-wait invariant
+2026-11-03T18:13:27Z BEGIN M12: fix#3 out-buffer overhaul — escape fast path, manual itoa, scratch buf reuse (abi.c/main.c)
+2026-11-03T18:13:27Z OK    M12: 42/42; saturated 14705 -> 16048 req/s (+9.1%); tail unchanged

@@ -1,0 +1,47 @@
+# opt-doc-4 — Fix #3: response out-buffer overhaul (C side) — and an honest note on where Lean fits
+
+Date: 2026-11-04 · Branch: `dev/optimize2` · Parent: opt-doc-3
+
+## Correction to opt-doc-1
+
+`x_out_json_escaped_str` + `grow` are **C (`runtime/abi.c`)**, not emitted asm —
+the emitted code only calls them (3 call sites in `app_gen.s`). opt-doc-1's
+classifier bucketed `x_*` names under "C runtime" but the prose called it the
+"emitted-asm path"; the perf stack (`x_out_json_escaped_str → grow`) settled it.
+The emitted layer itself stays <1% of hot CPU — consistent with its design role
+(routing/parsing/serializing logic), with C services (crypto/JSON/db/transport)
+carrying the heavy lifting.
+
+## Changes (`runtime/abi.c`, `runtime/main.c`) — no Lean re-derive, no promotion gate
+
+1. **Escape fast path**: the old loop called `x_out_mem`/`x_out_byte` (function
+   call + `grow(o,1)` capacity check) *per byte*. New: bulk-scan the run of
+   plain bytes (`>= 0x20`, not `"`/`\`), one `memcpy` per run; the per-byte
+   switch only runs on escape bytes and writes directly after a single
+   `grow(o,6)`. Contract byte-for-byte identical (42 goldens exercise escaped
+   seed content; comment pins the contract).
+2. **`x_out_int`**: `snprintf` → manual decimal (ids/counts on every row).
+3. **Scratch OutBuf reuse**: `main.c` used `struct OutBuf out = {0}` +
+   `free(out.base)` per request — the 256-byte initial `grow` ladder meant
+   ~6 reallocs per feed response plus a malloc/free pair per request. Now a
+   static 4 KiB scratch buffer is reused across requests (event loop is
+   single-threaded; content fully rewritten per response; realloc growth
+   persists in the global). Per-request allocation → zero on the steady path.
+
+## Why not a Lean change here
+
+The profiled cost lives in C services; the emitted layer is <1% of hot CPU.
+Rewriting the serializer's call pattern inside the emitter (e.g. emitting
+`x_out_reserve` calls per row) would re-derive `app_gen.s`, pay the
+promotion gate, and buy ~nothing the scratch buffer doesn't already amortize.
+Lean's leverage in this stack is proving app *logic* changes cheap and safe
+(corpus + proofs), not micro-optimizing C helper internals. Recorded as a
+deliberate decision.
+
+## Verification
+
+- `tools/test_local.sh`: **42/42** (byte-exact goldens over escaped content).
+- Saturation A/B (hot.js, 300 VUs, same box/warm state):
+  **14,705 → 16,048 req/s (+9.1%)**.
+- 4000-VU tail (official shape): p95=0.55ms, p99=10.4ms, max=74.1ms — tail
+  profile unchanged (no regression from the earlier fixes).
