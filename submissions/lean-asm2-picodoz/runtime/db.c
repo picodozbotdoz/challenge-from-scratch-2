@@ -77,6 +77,14 @@ int64_t x_db_prepare(const char *sql, int64_t len) {
 
 static sqlite3_stmt *h(int64_t stmt) { return (sqlite3_stmt *)(uintptr_t)stmt; }
 
+int x_db_bind_int(int64_t stmt, int32_t idx, int64_t v) {
+  return sqlite3_bind_int64(h(stmt), idx, v);
+}
+
+int x_db_bind_text(int64_t stmt, int32_t idx, const char *p, int64_t len) {
+  return sqlite3_bind_text(h(stmt), idx, p, (int)len, SQLITE_TRANSIENT);
+}
+
 int x_db_step(int64_t stmt) {
   int rc = sqlite3_step(h(stmt));
   if (rc == SQLITE_ROW) return 1;

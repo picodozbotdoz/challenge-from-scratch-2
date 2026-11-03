@@ -16,3 +16,8 @@
 2026-11-03T12:03:56Z NOTE  M2: derive exe works: lake exe derive -> app_gen.s (273 lines) assembles+links -no-pie; GAS Intel gotchas: BYTE PTR, no movzx rsi,esi
 2026-11-03T12:03:56Z OK    M2: server boots on 3457; suite: passed=10 failed=32 (gate 10); /health,/nope,id-classification all green; promoted gen/app_gen.s via tools/promote.sh
 2026-11-03T12:03:56Z MILE M2 done
+2026-11-03T12:06:20Z BEGIN M3: GET data path in asm
+2026-11-03T12:06:20Z NOTE  M3: emit .Lemit_post serializer (exact key order, JSON-escaped text via column_bytes, int formatting) + /posts/:id row fetch + /feed 20-post loop; SQL per SPEC
+2026-11-03T12:06:20Z NOTE  M3: bug fixed — .Lemit_post called C with misaligned stack (entered via call => rsp%16==8); added sub/add 8 frame
+2026-11-03T12:06:20Z OK    M3: suite passed=15 (goldens 1-6, health, 404s, id classification, post-not-found, feed length); gen/app_gen.s promoted
+2026-11-03T12:06:20Z MILE M3 done

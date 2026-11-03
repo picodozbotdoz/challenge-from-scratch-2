@@ -178,6 +178,10 @@ app_request:
     call x_out_str
     mov eax, 400
     jmp .Ldone
+.Lerr500:
+    mov rdi, r12
+    call x_fail
+    jmp .Ldone
 .Ldone:
     add rsp, 8
     pop r15
@@ -187,8 +191,80 @@ app_request:
     pop rbp
     pop rbx
     ret
+.Lemit_post:
+    sub rsp, 8
+    mov rdi, r12
+    lea rsi, [rip+.Lstr5]
+    mov edx, 6
+    call x_out_str
+    mov rdi, r13
+    xor esi, esi
+    call x_db_column_int
+    mov rdi, r12
+    mov rsi, rax
+    call x_out_int
+    mov rdi, r12
+    lea rsi, [rip+.Lstr6]
+    mov edx, 9
+    call x_out_str
+    mov rdi, r13
+    mov esi, 1
+    call x_db_column_bytes
+    mov r14, rax
+    mov rdi, r13
+    mov esi, 1
+    call x_db_column_text
+    mov rsi, rax
+    mov rdx, r14
+    mov rdi, r12
+    call x_out_json_escaped_str
+    mov rdi, r12
+    lea rsi, [rip+.Lstr7]
+    mov edx, 16
+    call x_out_str
+    mov rdi, r13
+    mov esi, 2
+    call x_db_column_bytes
+    mov r14, rax
+    mov rdi, r13
+    mov esi, 2
+    call x_db_column_text
+    mov rsi, rax
+    mov rdx, r14
+    mov rdi, r12
+    call x_out_json_escaped_str
+    mov rdi, r12
+    lea rsi, [rip+.Lstr8]
+    mov edx, 12
+    call x_out_str
+    mov rdi, r13
+    mov esi, 3
+    call x_db_column_bytes
+    mov r14, rax
+    mov rdi, r13
+    mov esi, 3
+    call x_db_column_text
+    mov rsi, rax
+    mov rdx, r14
+    mov rdi, r12
+    call x_out_json_escaped_str
+    mov rdi, r12
+    lea rsi, [rip+.Lstr9]
+    mov edx, 15
+    call x_out_str
+    mov rdi, r13
+    mov esi, 4
+    call x_db_column_int
+    mov rdi, r12
+    mov rsi, rax
+    call x_out_int
+    mov rdi, r12
+    mov esi, 125
+    call x_out_byte
+    add rsp, 8
+    ret
 .Lhealth:
-    lea rdi, [rip+.Lstr5]
+    lea rdi, [rip+.Lstr10]
     mov esi, 8
     call x_db_prepare
     test rax, rax
@@ -201,7 +277,7 @@ app_request:
     mov rdi, r13
     call x_db_reset
     mov rdi, r12
-    lea rsi, [rip+.Lstr6]
+    lea rsi, [rip+.Lstr11]
     mov edx, 36
     call x_out_str
     mov rdi, r12
@@ -219,7 +295,7 @@ app_request:
     call x_db_reset
 .Lhealth_bad:
     mov rdi, r12
-    lea rsi, [rip+.Lstr7]
+    lea rsi, [rip+.Lstr12]
     mov edx, 48
     call x_out_str
     call x_db_errmsg
@@ -239,12 +315,78 @@ app_request:
     mov eax, 503
     jmp .Ldone
 .Lfeed:
+    lea rdi, [rip+.Lstr13]
+    mov esi, 207
+    call x_db_prepare
+    test rax, rax
+    jz .Lerr500
+    mov r13, rax
     mov rdi, r12
-    call x_fail
+    lea rsi, [rip+.Lstr14]
+    mov edx, 10
+    call x_out_str
+    xor r15d, r15d
+.Lfeed_loop:
+    cmp r15d, 20
+    jae .Lfeed_end
+    mov rdi, r13
+    call x_db_step
+    cmp eax, 1
+    jne .Lfeed_end
+    test r15d, r15d
+    jz .Lfeed_first
+    mov rdi, r12
+    mov esi, 44
+    call x_out_byte
+.Lfeed_first:
+    call .Lemit_post
+    inc r15d
+    jmp .Lfeed_loop
+.Lfeed_end:
+    mov rdi, r12
+    lea rsi, [rip+.Lstr15]
+    mov edx, 2
+    call x_out_str
+    mov rdi, r13
+    call x_db_reset
+    mov eax, 200
     jmp .Ldone
 .Lgetpost:
+    mov r14, rax
+    lea rdi, [rip+.Lstr16]
+    mov esi, 175
+    call x_db_prepare
+    test rax, rax
+    jz .Lerr500
+    mov r13, rax
+    mov rdi, r13
+    mov esi, 1
+    mov rdx, r14
+    call x_db_bind_int
+    mov rdi, r13
+    call x_db_step
+    cmp eax, 1
+    jne .Lgetpost_notfound
     mov rdi, r12
-    call x_fail
+    lea rsi, [rip+.Lstr17]
+    mov edx, 8
+    call x_out_str
+    call .Lemit_post
+    mov rdi, r12
+    mov esi, 125
+    call x_out_byte
+    mov rdi, r13
+    call x_db_reset
+    mov eax, 200
+    jmp .Ldone
+.Lgetpost_notfound:
+    mov rdi, r13
+    call x_db_reset
+    mov rdi, r12
+    lea rsi, [rip+.Lstr18]
+    mov edx, 26
+    call x_out_str
+    mov eax, 404
     jmp .Ldone
 .Lpost:
     mov rdi, r12
@@ -262,10 +404,32 @@ app_request:
 .Lstr4:
     .byte 123, 34, 101, 114, 114, 111, 114, 34, 58, 34, 105, 110, 118, 97, 108, 105, 100, 32, 112, 111, 115, 116, 32, 105, 100, 34, 125
 .Lstr5:
-    .byte 83, 69, 76, 69, 67, 84, 32, 49
+    .byte 123, 34, 105, 100, 34, 58
 .Lstr6:
-    .byte 123, 34, 115, 116, 97, 116, 117, 115, 34, 58, 34, 111, 107, 34, 44, 34, 100, 98, 34, 58, 34, 111, 107, 34, 44, 34, 117, 112, 116, 105, 109, 101, 95, 115, 34, 58
+    .byte 44, 34, 98, 111, 100, 121, 34, 58, 34
 .Lstr7:
+    .byte 34, 44, 34, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 34, 58, 34
+.Lstr8:
+    .byte 34, 44, 34, 97, 117, 116, 104, 111, 114, 34, 58, 34
+.Lstr9:
+    .byte 34, 44, 34, 108, 105, 107, 101, 95, 99, 111, 117, 110, 116, 34, 58
+.Lstr10:
+    .byte 83, 69, 76, 69, 67, 84, 32, 49
+.Lstr11:
+    .byte 123, 34, 115, 116, 97, 116, 117, 115, 34, 58, 34, 111, 107, 34, 44, 34, 100, 98, 34, 58, 34, 111, 107, 34, 44, 34, 117, 112, 116, 105, 109, 101, 95, 115, 34, 58
+.Lstr12:
     .byte 123, 34, 115, 116, 97, 116, 117, 115, 34, 58, 34, 100, 101, 103, 114, 97, 100, 101, 100, 34, 44, 34, 100, 98, 34, 58, 34, 117, 110, 114, 101, 97, 99, 104, 97, 98, 108, 101, 34, 44, 34, 101, 114, 114, 111, 114, 34, 58
+.Lstr13:
+    .byte 83, 69, 76, 69, 67, 84, 32, 112, 46, 105, 100, 44, 32, 112, 46, 98, 111, 100, 121, 44, 32, 112, 46, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 44, 32, 117, 46, 117, 115, 101, 114, 110, 97, 109, 101, 44, 32, 40, 83, 69, 76, 69, 67, 84, 32, 99, 111, 117, 110, 116, 40, 42, 41, 32, 70, 82, 79, 77, 32, 108, 105, 107, 101, 115, 32, 108, 32, 87, 72, 69, 82, 69, 32, 108, 46, 112, 111, 115, 116, 95, 105, 100, 32, 61, 32, 112, 46, 105, 100, 41, 32, 65, 83, 32, 108, 105, 107, 101, 95, 99, 111, 117, 110, 116, 32, 70, 82, 79, 77, 32, 112, 111, 115, 116, 115, 32, 112, 32, 74, 79, 73, 78, 32, 117, 115, 101, 114, 115, 32, 117, 32, 79, 78, 32, 117, 46, 105, 100, 32, 61, 32, 112, 46, 117, 115, 101, 114, 95, 105, 100, 32, 79, 82, 68, 69, 82, 32, 66, 89, 32, 112, 46, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 32, 68, 69, 83, 67, 44, 32, 112, 46, 105, 100, 32, 68, 69, 83, 67, 32, 76, 73, 77, 73, 84, 32, 50, 48
+.Lstr14:
+    .byte 123, 34, 112, 111, 115, 116, 115, 34, 58, 91
+.Lstr15:
+    .byte 93, 125
+.Lstr16:
+    .byte 83, 69, 76, 69, 67, 84, 32, 112, 46, 105, 100, 44, 32, 112, 46, 98, 111, 100, 121, 44, 32, 112, 46, 99, 114, 101, 97, 116, 101, 100, 95, 97, 116, 44, 32, 117, 46, 117, 115, 101, 114, 110, 97, 109, 101, 44, 32, 40, 83, 69, 76, 69, 67, 84, 32, 99, 111, 117, 110, 116, 40, 42, 41, 32, 70, 82, 79, 77, 32, 108, 105, 107, 101, 115, 32, 108, 32, 87, 72, 69, 82, 69, 32, 108, 46, 112, 111, 115, 116, 95, 105, 100, 32, 61, 32, 112, 46, 105, 100, 41, 32, 65, 83, 32, 108, 105, 107, 101, 95, 99, 111, 117, 110, 116, 32, 70, 82, 79, 77, 32, 112, 111, 115, 116, 115, 32, 112, 32, 74, 79, 73, 78, 32, 117, 115, 101, 114, 115, 32, 117, 32, 79, 78, 32, 117, 46, 105, 100, 32, 61, 32, 112, 46, 117, 115, 101, 114, 95, 105, 100, 32, 87, 72, 69, 82, 69, 32, 112, 46, 105, 100, 32, 61, 32, 63
+.Lstr17:
+    .byte 123, 34, 112, 111, 115, 116, 34, 58
+.Lstr18:
+    .byte 123, 34, 101, 114, 114, 111, 114, 34, 58, 34, 112, 111, 115, 116, 32, 110, 111, 116, 32, 102, 111, 117, 110, 100, 34, 125
 
 .section .note.GNU-stack,"",@progbits

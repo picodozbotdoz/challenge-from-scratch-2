@@ -215,19 +215,149 @@ def emitHealth (a : Asm) : Asm :=
   let a := a.insn "jmp .Ldone"
   a
 
-/-- GET /posts/:id with a VALID id — full row fetch lands in M3; M2 stub. -/
+/-! ## Post serialization (mirrors Contract.postJson exactly)
+
+.Lemit_post: serialize the CURRENT row of stmt r13 into out r12.
+Columns: 0 id (int), 1 body (text), 2 created_at (text), 3 author (text),
+4 like_count (int). Text columns are JSON-escaped (bytes from column_bytes).
+Uses r14 as scratch; returns to caller.
+-/
+def emitPostObjectHelper (a : Asm) : Asm :=
+  let a := a.label ".Lemit_post"
+  let a := a.insn "sub rsp, 8"            -- align: we were call-ed (rsp%16==8)
+  -- {"id":
+  let a := outStr a "r12" "{\"id\":"
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "xor esi, esi"
+  let a := a.call "x_db_column_int"
+  let a := a.insn "mov rdi, r12"
+  let a := a.insn "mov rsi, rax"
+  let a := a.call "x_out_int"
+  -- "body"
+  let a := outStr a "r12" ",\"body\":\""
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 1"
+  let a := a.call "x_db_column_bytes"
+  let a := a.insn "mov r14, rax"
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 1"
+  let a := a.call "x_db_column_text"
+  let a := a.insn "mov rsi, rax"
+  let a := a.insn "mov rdx, r14"
+  let a := a.insn "mov rdi, r12"
+  let a := a.call "x_out_json_escaped_str"
+  -- "created_at"
+  let a := outStr a "r12" "\",\"created_at\":\""
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 2"
+  let a := a.call "x_db_column_bytes"
+  let a := a.insn "mov r14, rax"
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 2"
+  let a := a.call "x_db_column_text"
+  let a := a.insn "mov rsi, rax"
+  let a := a.insn "mov rdx, r14"
+  let a := a.insn "mov rdi, r12"
+  let a := a.call "x_out_json_escaped_str"
+  -- "author"
+  let a := outStr a "r12" "\",\"author\":\""
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 3"
+  let a := a.call "x_db_column_bytes"
+  let a := a.insn "mov r14, rax"
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 3"
+  let a := a.call "x_db_column_text"
+  let a := a.insn "mov rsi, rax"
+  let a := a.insn "mov rdx, r14"
+  let a := a.insn "mov rdi, r12"
+  let a := a.call "x_out_json_escaped_str"
+  -- "like_count":N}
+  let a := outStr a "r12" "\",\"like_count\":"
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 4"
+  let a := a.call "x_db_column_int"
+  let a := a.insn "mov rdi, r12"
+  let a := a.insn "mov rsi, rax"
+  let a := a.call "x_out_int"
+  let a := a.insn "mov rdi, r12"
+  let a := a.insn "mov esi, 125"          -- '}'
+  let a := a.call "x_out_byte"
+  let a := a.insn "add rsp, 8"
+  let a := a.insn "ret"
+  a
+
+/-- GET /posts/:id — row fetch; id already validated (rax = id). -/
 def emitGetPostValid (a : Asm) : Asm :=
   let a := a.label ".Lgetpost"
+  let a := a.insn "mov r14, rax"          -- the id
+  let sql := "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = ?"
+  let (a, lSql) := a.poolStr sql
+  let a := a.insn (s!"lea rdi, [rip+{lSql}]")
+  let a := a.insn (s!"mov esi, {String.length sql}")
+  let a := a.call "x_db_prepare"
+  let a := a.insn "test rax, rax"
+  let a := a.insn "jz .Lerr500"
+  let a := a.insn "mov r13, rax"
+  let a := a.insn "mov rdi, r13"
+  let a := a.insn "mov esi, 1"
+  let a := a.insn "mov rdx, r14"
+  let a := a.call "x_db_bind_int"
+  let a := a.insn "mov rdi, r13"
+  let a := a.call "x_db_step"
+  let a := a.insn "cmp eax, 1"
+  let a := a.insn "jne .Lgetpost_notfound"
+  let a := outStr a "r12" "{\"post\":"
+  let a := a.insn "call .Lemit_post"
   let a := a.insn "mov rdi, r12"
-  let a := a.call "x_fail"                -- eax = 500
+  let a := a.insn "mov esi, 125"          -- '}'
+  let a := a.call "x_out_byte"
+  let a := a.insn "mov rdi, r13"
+  let a := a.call "x_db_reset"
+  let a := a.insn "mov eax, 200"
+  let a := a.insn "jmp .Ldone"
+  let a := a.label ".Lgetpost_notfound"
+  let a := a.insn "mov rdi, r13"
+  let a := a.call "x_db_reset"
+  let a := outErrorBody a "r12" "post not found"
+  let a := a.insn "mov eax, 404"
   let a := a.insn "jmp .Ldone"
   a
 
-/-- GET /feed — M3; M2 stub. -/
+/-- GET /feed — the 20 newest posts. -/
 def emitFeed (a : Asm) : Asm :=
   let a := a.label ".Lfeed"
+  let sqlf := "SELECT p.id, p.body, p.created_at, u.username, (SELECT count(*) FROM likes l WHERE l.post_id = p.id) AS like_count FROM posts p JOIN users u ON u.id = p.user_id ORDER BY p.created_at DESC, p.id DESC LIMIT 20"
+  let (a, lSql) := a.poolStr sqlf
+  let a := a.insn (s!"lea rdi, [rip+{lSql}]")
+  let a := a.insn (s!"mov esi, {String.length sqlf}")
+  let a := a.call "x_db_prepare"
+  let a := a.insn "test rax, rax"
+  let a := a.insn "jz .Lerr500"
+  let a := a.insn "mov r13, rax"
+  let a := outStr a "r12" "{\"posts\":["
+  let a := a.insn "xor r15d, r15d"        -- emitted count
+  let a := a.label ".Lfeed_loop"
+  let a := a.insn "cmp r15d, 20"
+  let a := a.insn "jae .Lfeed_end"
+  let a := a.insn "mov rdi, r13"
+  let a := a.call "x_db_step"
+  let a := a.insn "cmp eax, 1"
+  let a := a.insn "jne .Lfeed_end"
+  let a := a.insn "test r15d, r15d"
+  let a := a.insn "jz .Lfeed_first"
   let a := a.insn "mov rdi, r12"
-  let a := a.call "x_fail"
+  let a := a.insn "mov esi, 44"           -- ','
+  let a := a.call "x_out_byte"
+  let a := a.label ".Lfeed_first"
+  let a := a.insn "call .Lemit_post"
+  let a := a.insn "inc r15d"
+  let a := a.insn "jmp .Lfeed_loop"
+  let a := a.label ".Lfeed_end"
+  let a := outStr a "r12" "]}"
+  let a := a.insn "mov rdi, r13"
+  let a := a.call "x_db_reset"
+  let a := a.insn "mov eax, 200"
   let a := a.insn "jmp .Ldone"
   a
 
@@ -314,6 +444,10 @@ def emitAppRequest (a : Asm) : Asm :=
   let a := outErrorBody a "r12" "invalid post id"
   let a := a.insn "mov eax, 400"
   let a := a.insn "jmp .Ldone"
+  let a := a.label ".Lerr500"
+  let a := a.insn "mov rdi, r12"
+  let a := a.call "x_fail"
+  let a := a.insn "jmp .Ldone"
   -- epilogue
   let a := a.label ".Ldone"
   let a := a.insn "add rsp, 8"
@@ -390,6 +524,7 @@ def program : String :=
   let a := emitStrlen a
   let a := emitAppInit a
   let a := emitAppRequest a
+  let a := emitPostObjectHelper a
   let a := emitHealth a
   let a := emitFeed a
   let a := emitGetPostValid a

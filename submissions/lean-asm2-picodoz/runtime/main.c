@@ -81,31 +81,6 @@ static void conn_close(struct conn *c) {
   free_slots[++free_top] = slot;
 }
 
-/* dispatch one complete request through the emitted application layer */
-static void serve_request(struct conn *c, int slot) {
-  struct AppReq req;
-  struct OutBuf out = {0};
-  size_t consumed = 0;
-  int prc = http_parse_request(c, &req, &consumed);
-  if (prc < 0) {
-    const char *bad = "{\"error\":\"not found\"}";
-    c->keep_alive = 0;
-    http_frame_response(c, 404, bad, strlen(bad));
-    c->rlen = 0;
-    return;
-  }
-  if (prc == 0) { arm_read(c, slot); return; }   /* need more bytes */
-
-  int status = app_request(&req, &out);
-  http_frame_response(c, status, out.base ? out.base : "", out.len);
-  free(out.base);
-
-  /* consume the request; keep any pipelined bytes */
-  c->rlen -= consumed;
-  if (c->rlen > 0) memmove(c->rbuf, c->rbuf + consumed, c->rlen);
-  else c->rlen = 0;
-}
-
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
   setvbuf(stdout, NULL, _IOLBF, 0);
