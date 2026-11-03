@@ -52,9 +52,60 @@ static uint64_t ud(int op, int slot) {
 int db_open(const char *path);
 void db_close(void);
 
+/* ---- deferred re-arm queue (M11) ------------------------------------------
+ * When the SQ is full we must NOT close the conn (drop storm under burst) nor
+ * exit (arm_accept did). A conn with a deferred arm has no in-flight op, so no
+ * cqe can race it; flush revalidates (fd, closing, flag) before re-arming.
+ * flush runs after the final submit of each batch and everything is submitted
+ * again before the next wait — a deferred accept can never sit unsubmitted
+ * behind a blocking wait. */
+struct defer_ent { uint16_t slot; uint8_t op; };
+static struct defer_ent g_dq[MAXCONN + 8];
+static int g_dq_head, g_dq_tail;                 /* empty: head == tail */
+static int g_accept_deferred = 0;
+static void arm_accept(void);
+static void arm_read(struct conn *c, int slot);
+static void arm_write(struct conn *c, int slot);
+static int flush_deferred(void);
+
+static void defer_arm(int op, int slot) {
+  struct conn *c = &conns[slot];
+  if (c->deferred) return;                       /* already queued */
+  int next = (g_dq_tail + 1) % (MAXCONN + 8);
+  if (next == g_dq_head) { c->closing = 1; return; }   /* cannot happen: one entry per conn */
+  c->deferred = 1;
+  g_dq[g_dq_tail].slot = (uint16_t)slot;
+  g_dq[g_dq_tail].op = (uint8_t)op;
+  g_dq_tail = next;
+}
+
+static int flush_deferred(void) {
+  int armed = 0;
+  while (g_dq_head != g_dq_tail) {
+    struct defer_ent *e = &g_dq[g_dq_head];
+    struct conn *c = &conns[e->slot];
+    int op = e->op;
+    g_dq_head = (g_dq_head + 1) % (MAXCONN + 8);
+    c->deferred = 0;                             /* clear before retry: re-full re-queues */
+    if (!c->fd || c->closing) continue;          /* closed while queued (sweep) */
+    if (op == OP_READ) { arm_read(c, e->slot); }
+    else if (op == OP_WRITE) { arm_write(c, e->slot); }
+    else if (op == OP_ACCEPT) { arm_accept(); }
+    if (ring.sq_pending >= (int)ring.sq_ring_entries) break;   /* SQ full again: rest next round */
+    armed++;
+  }
+  if (g_accept_deferred && g_dq_head == g_dq_tail) {
+    /* accept has no slot; retry it last, once SQ has room */
+    g_accept_deferred = 0;
+    arm_accept();
+    armed++;
+  }
+  return armed;
+}
+
 static void arm_accept(void) {
   struct io_uring_sqe *s = uring_next_sqe(&ring);
-  if (!s) { fprintf(stderr, "sq full\n"); exit(1); }
+  if (!s) { g_accept_deferred = 1; return; }
   s->opcode = UOP_ACCEPT;
   s->fd = listener_fd;
   s->rw_flags = SOCK_NONBLOCK | SOCK_CLOEXEC;
@@ -70,7 +121,7 @@ static void arm_read(struct conn *c, int slot) {
     c->rbuf = nb; c->rcap = ncap;
   }
   struct io_uring_sqe *s = uring_next_sqe(&ring);
-  if (!s) { c->closing = 1; return; }
+  if (!s) { defer_arm(OP_READ, slot); return; }
   s->opcode = UOP_READ;
   s->fd = c->fd;
   s->addr = (uint64_t)(c->rbuf + c->rlen);
@@ -80,7 +131,7 @@ static void arm_read(struct conn *c, int slot) {
 
 static void arm_write(struct conn *c, int slot) {
   struct io_uring_sqe *s = uring_next_sqe(&ring);
-  if (!s) { c->closing = 1; return; }
+  if (!s) { defer_arm(OP_WRITE, slot); return; }
   s->opcode = UOP_WRITE;
   s->fd = c->fd;
   s->addr = (uint64_t)(c->wbuf + c->woff);
@@ -159,7 +210,7 @@ int main(void) {
   if (bind(listener_fd, (struct sockaddr *)&a, sizeof a) < 0) { perror("bind"); return 1; }
   if (listen(listener_fd, 1024) < 0) { perror("listen"); return 1; }
 
-  if (uring_open(&ring, 1024) < 0) { perror("io_uring_setup"); return 1; }
+  if (uring_open(&ring, 2048) < 0) { perror("io_uring_setup"); return 1; }
   fprintf(stderr, "feed-asm serving %s:%d\n", host, port);
 
   for (int i = 1; i < MAXCONN; i++) free_slots[++free_top] = i;
@@ -261,6 +312,8 @@ int main(void) {
       if (uring_get_cqe(&ring, &cqe) < 0) break;
     }
     uring_submit(&ring);
+    flush_deferred();                    /* re-arm what SQ-full had deferred */
+    if (ring.sq_pending) uring_submit(&ring);   /* everything out before the wait */
   }
   return 0;
 }

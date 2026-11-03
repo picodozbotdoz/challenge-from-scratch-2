@@ -1,0 +1,53 @@
+# opt-doc-3 — Fix #2: SQ-full deferred re-arm (no conn drops) + perf call-graph re-profile
+
+Date: 2026-11-04 · Branch: `dev/optimize2` · Parent: opt-doc-2
+
+## perf call-graph re-profile (perf now installed, paranoid=1)
+
+`perf record -F 999 -g` under hot load (14,705 req/s — slightly above the
+pre-worker 13,454, the checkpoint worker helps saturation too):
+
+| share | symbol |
+|---|---|
+| 6.75% | `sqlite3VdbeExec` |
+| **6.3%** | `x_out_json_escaped_str` 4.79% + `grow` 1.54% — escape appends **byte-by-byte through the growable buffer** (`grow` called from inside escape) |
+| 4.7% | `BtreeTableMoveto` 2.84% + `BtreeIndexMoveto` 1.82% (cursor seeks) |
+| 1.56% | `pthread_mutex_lock` — sqlite serialized mode; removable via `SQLITE_OPEN_NOMUTEX` (each conn is single-thread) |
+| ~12% | kernel (NMI overhead, syscall path, nf_conntrack) |
+
+This re-ranks the backlog: the emitter-side output path (Lean fix #3) is now
+the #2 CPU consumer, ahead of cursor behavior; sqlite mutex overhead is a
+cheap C-side win (fix #4).
+
+## Change (fix #2)
+
+`runtime/main.c`, `runtime/http.h`, ring 1024 → 2048. No ABI/emitted changes.
+
+Old SQ-full behavior: `arm_read` silently marked the conn closing (drop storm
+under accept bursts at very high VU), `arm_accept` **exited the server**.
+New: a deferred re-arm queue.
+
+- `defer_arm(op, slot)` — per-conn `deferred` flag guarantees one queued entry
+  max; queue capacity MAXCONN+8 (one entry per conn is structurally impossible
+  to exceed; overflow closes defensively).
+- `flush_deferred()` runs after each batch's final submit. A conn with a
+  deferred arm has **no in-flight op** (the arm decision came from a cqe we
+  just processed), so no cqe can race the re-arm; entries are revalidated
+  (fd, closing, flag — conn_close clears fd, memset-on-reuse clears the flag)
+  before re-arming. Flag is cleared *before* the retry so a re-full SQ
+  re-queues instead of losing the arm.
+- Deferred accept is retried last; the loop ends with
+  `flush_deferred(); if (sq_pending) submit;` so **everything is submitted
+  before every blocking wait** — a deferred accept can never sit behind a
+  `min_complete=1` wait (that would deadlock the whole server).
+- Ring 2048: SQ-full now needs >2048 in-flight arms vs 16384 conns; with the
+  queue, even that is safe instead of fatal.
+
+## Verification
+
+- `tools/test_local.sh`: **42/42**.
+- 4000-VU tail (official shape): p95=0.61ms, p99=6.01ms, max=59.3ms —
+  consistent with opt-doc-2 post-fix profile (no regression, still no freeze).
+- The failure mode this removes is rare by nature (needs >1024 simultaneous
+  arm decisions); correctness argued above + suite + soak. It cannot make
+  things slower in the common case (queue empty; one extra branch per arm).

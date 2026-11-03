@@ -15,6 +15,7 @@ struct conn {
   size_t wlen, woff, wcap;
   int keep_alive;
   int closing;        /* close after flush */
+  int deferred;       /* arm pending in the SQ-full defer queue (main.c) */
 };
 
 int http_parse_request(struct conn *c, struct AppReq *req, size_t *consumed);
