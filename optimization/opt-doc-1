@@ -1,0 +1,118 @@
+# opt-doc-1 — Profiling baseline: where the time goes, and what caps the score
+
+Date: 2026-11-03/04 · Branch: `dev/optimize1` · Baseline: M8 (42/42, k6 1000 VU p95=0.58ms p99=2.2ms)
+
+## Question
+
+Submission `lean-asm2-picodoz` passes 42/42 and benches well, but the score is
+"highest VUs holding p95<500ms / p99<1000ms for 5min". Where does CPU go, what
+syscalls do we make per request, and what actually breaks first at high VU counts?
+
+## Tooling (no root, no perf available at the time)
+
+Kit now in `optimization/prof-kit/` (runnable copies were built in `work/prof/`,
+which is gitignored):
+
+- `sampler.c` — ~200-line ptrace rip-sampling profiler (~460 Hz). `perf` was
+  unavailable and `perf_event_paranoid=3` blocked it; a ptrace parent sampling
+  its own child is always permitted. Lessons: `waitpid` needs `WUNTRACED` for
+  the SIGSTOP handshake; SEIZE + group-stop leaks SIGSTOP into the sample loop
+  (fixed by seizing a running child); SIGALRM delivery under ptrace parks rips
+  at `on_alarm+0x0` and pollutes the histogram (fixed via `FEED_TICK_SECS=3600`
+  during profiling); snapshot `/proc/pid/maps` periodically, not at exit (the
+  final snapshot races the kill and truncates to 0 bytes).
+- `resolve.py` — rips → module → symbol. `/proc/pid/maps` for load bases
+  (ASLR!); `nm -nS` for the server; **`nm -D` addresses of shared libs are
+  ELF vaddrs and must be rebased by the module's map base** (first version
+  produced `+0x7ffa…` offsets). SQLite is *dynamically linked* (libsqlite3.so.0
+  3.46.1), so its dynsym only names exported functions. Full internals came
+  from Debian's dbgsym package (no root needed):
+  `apt/wget` `libsqlite3-0-dbgsym_3.46.1-7+deb13u2_amd64.deb` from
+  `debian-debug` → `dpkg -x` → `nm` the .debug file → 2,812 internal symbols.
+- `hot.js` — official `bench/load.js` request mix without think times, to
+  saturate the server for CPU profiles (NOT the scoring shape).
+- `run_prof.sh` — modes: `plain` (official load + sampler), `hot`, `strace`.
+- `run_tail.sh` — clean uninstrumented official-shape runs at high VUs with
+  1 Hz telemetry (ticks, faults, conns, RSS, rchar/write_bytes, WAL size) and a
+  5 Hz wchan/syscall probe to catch rare stalls.
+
+## 1. CPU profile
+
+Server CPU per request (from /proc stat ticks across k6 runs): **~54 µs/req**,
+stable across 13.4k req/s saturation. Official-shape load (~80 req/s at
+1000 VUs, ~330 at 4000) keeps the server **~97–99.5% idle** — parked in
+`io_uring_enter` (96.4% of plain-mode samples). CPU is not the score limiter;
+saturated capacity is ~13.4k req/s.
+
+Hot profile (saturation, tick disabled, 21k samples, dbgsym-resolved):
+
+| share of busy CPU | where |
+|---|---|
+| ~44% | sqlite3 internals: `walFindFrame` 3.6%, `BtreeTableMoveto`+`IndexMoveto` ~2%, `pcache1Fetch`, `btreeInitPage`, `sqlite3GetVarint`, VDBE — a long flat tail = per-query fixed overhead |
+| ~8% | libc internals (malloc/stdio; glibc dbgsym 404'd, unresolved) |
+| ~2.6% | `x_out_json_escaped_str` — emitted-asm JSON escaping on the feed path |
+| ~1.7% | `grow` — response buffer reallocs (feed body not pre-sized) |
+| ~1.5% | `syscall` stub (`io_uring_enter` submit/wait) |
+
+Lean/asm app layer is a rounding error at this DB-dominated stage.
+
+## 2. Syscall census (strace -c under official load)
+
+~3.2 syscalls/request: `io_uring_enter` 1.5/req, **`fcntl` 1.25/req** (WAL-index
+shm locks, 5 µs each, 180k/run — biggest syscall *count*), `pwrite64` 0.28/req
+(WAL writes), `setsockopt` 1/new-conn, `fdatasync` 62/run (≈ every 2.4 s),
+`pread64` ~0 (cache hits).
+
+## 3. The real finding — bimodal tail under sustained 4000-VU official load
+
+Four clean runs (no instrumentation), 4000 VUs, 60s ramp + 120s hold:
+
+| run | p95 | p99 | max |
+|---|---|---|---|
+| 1 | 0.81 ms | 19.8 ms | 455 ms |
+| 2 | 470 ms | **5.93 s** | **7.52 s** — would FAIL p99<1000ms |
+| 3 | 1.55 ms | 7.08 ms | 210 ms |
+| 4 | 0.68 ms | 2.63 ms | 89 ms |
+
+Run 2 telemetry: the server made **zero progress for ~4.4 s** (cpu+0 ticks,
+faults+0, rchar/write_bytes and syscall counters frozen), then drained 2,773
+bunched requests, resuming with a 3.7 MB write burst. A process-level block,
+not load, not CPU, not memory.
+
+Attribution:
+- **Not the sweep tick**: spike windows uniform mod 10 s.
+- **`fdatasync` runs inline on the event loop** inside `sqlite3_step` —
+  `wal_autocheckpoint` (1000 pages ≈ 4 MB) copies WAL→DB then fdatasyncs the
+  main DB. strace: 62/run, median 7.45 ms, max 106 ms → run 1's scattered
+  40–90 ms bursts.
+- **5 Hz wchan probe** caught the kernel sleep site during a *clean* run:
+  `jbd2_log_wait_commit` (ext4 journal commit) under syscall 75 (`fdatasync`).
+  Rare jbd2 stalls (shared-disk contention) turn the inline checkpoint into a
+  multi-second all-connection freeze. That is run 2.
+- Exonerated: server CPU, page faults, network storage (local ext4), SIGALRM
+  sweep, `uring.c` ring logic.
+
+Secondary robustness note: ring = 1024 entries vs 16384 conns; on SQ-full
+`arm_read` silently marks the conn closing (`main.c:71`) — a drop-storm risk
+under accept bursts at extreme VUs.
+
+## Fixes, ranked (this loop's backlog)
+
+1. **Keep fdatasync off the event loop** (C runtime, `db.c`/`main.c`).
+   Worker thread + own connection running periodic `wal_checkpoint(PASSIVE)`
+   (`wal_autocheckpoint=0` on the event-loop conn; `synchronous=NORMAL` means
+   the writer path never syncs WAL commits). ABI seam `x_db_*` absorbs it; no
+   Lean/emitter changes. Expected: removes 7–106 ms stalls and the multi-second
+   freeze mode entirely.
+2. **SQ-full robustness**: retry/queue instead of closing conns (C runtime).
+3. **Emitter micro-opts** (Lean, corpus-gated): pre-size feed out-buffer
+   (`grow` 1.7%), JSON-escape ASCII fast path (`x_out_json_escaped_str` 2.6%).
+4. **fcntl/WAL-index lock traffic** (1.25/req): batch per-request SQL into one
+   txn; only if profiling shows it matters after 1–3.
+
+## Verification protocol for every fix
+
+`tools/test_local.sh` (42/42 gate) → promotion gate for emitted code
+(`tools/promote.sh`) → tail runs (`run_tail.sh`, ≥2× at 4000 VU, escalate VUs)
+→ re-profile (`run_prof.sh hot` / now `perf record -g` since perf is
+installed) → journal + opt-doc-n.
