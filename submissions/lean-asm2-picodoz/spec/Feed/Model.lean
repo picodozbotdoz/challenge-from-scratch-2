@@ -26,17 +26,23 @@ def stripQuery (p : String) : String :=
   | first :: _ => first
   | [] => p
 
-/-- Split a path into segments: "/posts/42/like" → ["posts","42","like"]. -/
+/-
+Split a path into segments: "/posts/42/like" → ["posts","42","like"].
+One leading '/' is stripped; every '/' after that separates segments, and EMPTY
+segments are preserved — so "/posts/1/" → ["posts","1",""] (no route → 404) and
+"/posts//like" → ["posts","","like"] (404). Trailing-slash variants are NOT
+identified with the bare path.
+-/
 def segments (p : String) : List String :=
   let cs := (stripQuery p).toList
   let rec go (cs : List Char) (acc : List Char) : List String :=
     match cs with
-    | [] => if acc.isEmpty then [] else [String.ofList acc.reverse]
-    | '/' :: rest =>
-      if acc.isEmpty then go rest []
-      else String.ofList acc.reverse :: go rest []
+    | [] => [String.ofList acc.reverse]
+    | '/' :: rest => String.ofList acc.reverse :: go rest []
     | c :: rest => go rest (c :: acc)
-  go cs []
+  match cs with
+  | '/' :: rest => go rest []
+  | _ => []
 
 /-! ## Handlers -/
 

@@ -12,3 +12,7 @@ lean_lib Feed where
 lean_exe «speccheck» {
   root := `Feed.Main
 }
+
+lean_exe «derive» {
+  root := `Feed.Derive
+}
