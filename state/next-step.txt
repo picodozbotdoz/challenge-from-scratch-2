@@ -1,1 +1,1 @@
-git push -u origin master
+optimization loop M9-M14 complete on dev/optimize2 (see optimization/opt-doc-1..6). Optional follow-ups: git push -u origin dev/optimize2 ; judge-box validation of tail stability; restart loop only on the triggers in optimization/opt-doc-6
